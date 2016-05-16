@@ -39,8 +39,10 @@ public class TryArtifactCommandRegister {
                                         tool.fluff("Path %s added to classpath", path);
                                     });
                             return true;
-                        } catch (DependencyCollectionException | DependencyResolutionException e) {
-                            tool.error("%s", e);
+                        } catch (DependencyCollectionException |
+                                DependencyResolutionException |
+                                IllegalArgumentException e) {
+                            tool.error("%s", e.getMessage());
                             return false;
                         }
                     }
