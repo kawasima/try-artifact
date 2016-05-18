@@ -56,7 +56,7 @@ public class TryArtifactCommandRegister {
                                 .map(a -> new SourceCodeAnalysis.Suggestion(a.toString(), false))
                                 .forEach(results::add);
                         anchor[0] = 0; // code.length();
-                    } catch (IOException ignore) {
+                    } catch (IOException | IllegalArgumentException ignore) {
 
                     }
                     return results;
