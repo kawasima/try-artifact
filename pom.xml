@@ -11,7 +11,7 @@
 
     <groupId>net.unit8.tryartifact</groupId>
     <artifactId>try-artifact</artifactId>
-    <version>0.2.0-SNAPSHOT</version>
+    <version>0.2.0</version>
     <packaging>jar</packaging>
 
     <description>Try a maven artifact on-demand in JShell</description>
