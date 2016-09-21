@@ -4,12 +4,12 @@ TryArtifact is a tool for tasting a maven artifacts in the JShell.
 
 ## Usage
 
-Download from https://github.com/kawasima/try-artifact/releases/tag/v0.1.2
+Download from https://github.com/kawasima/try-artifact/releases/tag/v0.2.0
 
 Start TryArtifact's JShell.
 
 ```
-% java -jar try-artifact-0.1.2.jar
+% java -jar try-artifact-0.2.0.jar
 
 |  Welcome to JShell -- Version (version info not available)
 |  Type /help for help
