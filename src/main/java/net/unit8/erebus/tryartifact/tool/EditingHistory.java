@@ -124,7 +124,7 @@ public abstract class EditingHistory implements History {
             complete.append(fullHistory.get(i));
         }
         complete.append(line);
-        if (analyzeCompletion(complete.toString()).completeness.isComplete) {
+        if (analyzeCompletion(complete.toString()).completeness().isComplete()) {
             currentLine.span[1] = fullSize; //TODO: +1?
             currentDelegate = fullHistory;
         }

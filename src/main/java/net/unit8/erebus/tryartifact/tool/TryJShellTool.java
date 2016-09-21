@@ -499,7 +499,7 @@ public class TryJShellTool {
                 .out(userout)
                 .err(usererr)
                 .tempVariableNameGenerator(() -> "$" + currentNameSpace.tidNext())
-                .idGenerator((sn, i) -> (currentNameSpace == startNamespace || state.status(sn).isActive)
+                .idGenerator((sn, i) -> (currentNameSpace == startNamespace || state.status(sn).isActive())
                         ? currentNameSpace.tid(sn)
                         : errorNamespace.tid(sn))
                 .build();
@@ -1096,7 +1096,7 @@ public class TryJShellTool {
             }
         }
 
-        return result.sorted((s1, s2) -> s1.continuation.compareTo(s2.continuation))
+        return result.sorted((s1, s2) -> s1.continuation().compareTo(s2.continuation()))
                 .collect(Collectors.toList());
     }
 
@@ -1406,7 +1406,7 @@ public class TryJShellTool {
     }
 
     private boolean isActive(Snippet sn) {
-        return state.status(sn).isActive;
+        return state.status(sn).isActive();
     }
 
     private boolean mainActive(Snippet sn) {
@@ -1465,7 +1465,7 @@ public class TryJShellTool {
             return false;
         }
         List<Snippet> snippets = stream
-                .filter(sn -> state.status(sn).isActive && sn instanceof PersistentSnippet)
+                .filter(sn -> state.status(sn).isActive() && sn instanceof PersistentSnippet)
                 .collect(toList());
         if (snippets.isEmpty()) {
             hard("The argument did not specify an active import, variable, method, or class to drop.");
@@ -1546,18 +1546,18 @@ public class TryJShellTool {
                     boolean failed = false;
                     while (true) {
                         CompletionInfo an = analysis.analyzeCompletion(s);
-                        if (!an.completeness.isComplete) {
+                        if (!an.completeness().isComplete()) {
                             break;
                         }
-                        String tsrc = trimNewlines(an.source);
+                        String tsrc = trimNewlines(an.source());
                         if (!failed && !currSrcs.contains(tsrc)) {
                             failed = processCompleteSource(tsrc);
                         }
                         nextSrcs.add(tsrc);
-                        if (an.remaining.isEmpty()) {
+                        if (an.remaining().isEmpty()) {
                             break;
                         }
-                        s = an.remaining;
+                        s = an.remaining();
                     }
                     currSrcs = nextSrcs;
                 } catch (IllegalStateException ex) {
@@ -1874,14 +1874,14 @@ public class TryJShellTool {
     private String processSource(String srcInput) throws IllegalStateException {
         while (true) {
             CompletionInfo an = analysis.analyzeCompletion(srcInput);
-            if (!an.completeness.isComplete) {
-                return an.remaining;
+            if (!an.completeness().isComplete()) {
+                return an.remaining();
             }
-            boolean failed = processCompleteSource(an.source);
-            if (failed || an.remaining.isEmpty()) {
+            boolean failed = processCompleteSource(an.source());
+            if (failed || an.remaining().isEmpty()) {
                 return "";
             }
-            srcInput = an.remaining;
+            srcInput = an.remaining();
         }
     }
 
@@ -1898,7 +1898,7 @@ public class TryJShellTool {
             // If any main snippet is active, this should be replayable
             // also ignore var value queries
             isActive |= e.causeSnippet() == null &&
-                    e.status().isActive &&
+                    e.status().isActive() &&
                     e.snippet().subKind() != VAR_VALUE_SUBKIND;
         }
         // If this is an active snippet and it didn't cause the backend to die,
@@ -1921,7 +1921,7 @@ public class TryJShellTool {
         if (ste.causeSnippet() == null) {
             // main event
             printDiagnostics(source, diagnostics, false);
-            if (ste.status().isActive) {
+            if (ste.status().isActive()) {
                 if (ste.exception() != null) {
                     if (ste.exception() instanceof EvalException) {
                         printEvalException((EvalException) ste.exception());
@@ -1969,7 +1969,7 @@ public class TryJShellTool {
             case VALID:
             case RECOVERABLE_DEFINED:
             case RECOVERABLE_NOT_DEFINED:
-                if (ste.previousStatus().isActive) {
+                if (ste.previousStatus().isActive()) {
                     action = ste.isSignatureChange()
                             ? FormatAction.REPLACED
                             : FormatAction.MODIFIED;
