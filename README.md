@@ -1,6 +1,6 @@
 # Try artifact
 
-TryArtifact is a tool for tasting a maven artifacts in the JShell.
+TryArtifact is a tool for testing a maven artifacts in the JShell.
 
 ## Usage
 
