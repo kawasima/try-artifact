@@ -3,15 +3,9 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <parent>
-        <groupId>org.sonatype.oss</groupId>
-        <artifactId>oss-parent</artifactId>
-        <version>9</version>
-    </parent>
-
     <groupId>net.unit8.tryartifact</groupId>
     <artifactId>try-artifact</artifactId>
-    <version>0.3.0-SNAPSHOT</version>
+    <version>0.3.0</version>
     <packaging>jar</packaging>
 
     <description>Try a maven artifact on-demand in JShell</description>
@@ -29,15 +23,12 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.1</version>
+                <version>3.7.0</version>
                 <configuration>
-                    <fork>true</fork>
-                    <executable>/usr/lib/jvm/java-9-jdk/bin/javac</executable>
                     <source>${java.version}</source>
                     <target>${java.version}</target>
                     <compilerArgs>
                         <arg>-XDignore.symbol.file</arg>
-                        <arg>-XaddExports:java.jshell/jdk.internal.jshell.tool=ALL-UNNAMED</arg>
                     </compilerArgs>
                 </configuration>
             </plugin>
@@ -81,7 +72,7 @@
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-simple</artifactId>
-            <version>1.7.21</version>
+            <version>1.7.25</version>
         </dependency>
         <dependency>
             <groupId>net.unit8.erebus</groupId>

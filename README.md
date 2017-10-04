@@ -4,12 +4,12 @@ TryArtifact is a tool for testing a maven artifacts in the JShell.
 
 ## Usage
 
-Download from https://github.com/kawasima/try-artifact/releases/tag/v0.2.0
+Download from https://github.com/kawasima/try-artifact/releases/tag/v0.3.0
 
 Start TryArtifact's JShell.
 
 ```
-% java -jar try-artifact-0.2.0.jar
+% java -jar try-artifact-0.3.0.jar
 
 |  Welcome to JShell -- Version (version info not available)
 |  Type /help for help
@@ -72,7 +72,7 @@ org.smartdeveloperhub.harvester.org:org-harvester-aggregator:pom:0.1.0   org.sma
 When the artifact is resolved, you can be using it.
 
 ```
--> /resolve org.apache.commons:commons-lang3:jar:3.4
+-> /resolve org.apache.commons:commons-lang3:jar:3.6
 |  Path /home/kawasima/.m2/repository/org/apache/commons/commons-lang3/3.4/commons-lang3-3.4.jar added to classpath
 
 
