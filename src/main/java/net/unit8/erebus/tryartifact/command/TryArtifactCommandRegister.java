@@ -53,7 +53,7 @@ public class TryArtifactCommandRegister {
                     try {
                         List<Artifact> artifacts = searcher.searchIncremental(code);
                         artifacts.stream()
-                                .map(a -> new SourceCodeAnalysis.Suggestion(a.toString(), false))
+                                .map(a -> new ArgSuggestion(a.toString()))
                                 .forEach(results::add);
                         anchor[0] = 0; // code.length();
                     } catch (IOException | IllegalArgumentException ignore) {
@@ -65,4 +65,19 @@ public class TryArtifactCommandRegister {
                 TryJShellTool.CommandKind.REPLAY));
     }
 
+    static class ArgSuggestion implements SourceCodeAnalysis.Suggestion {
+        private final String continuation;
+
+        public ArgSuggestion(String continuation) {
+            this.continuation = continuation;
+        }
+
+        public String continuation() {
+            return this.continuation;
+        }
+
+        public boolean matchesType() {
+            return false;
+        }
+    }
 }

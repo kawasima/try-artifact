@@ -25,6 +25,7 @@ package net.unit8.erebus.tryartifact.tool;
  * questions.
  */
 
+import jdk.jshell.SourceCodeAnalysis;
 import jdk.jshell.SourceCodeAnalysis.CompletionInfo;
 import jdk.jshell.SourceCodeAnalysis.QualifiedNames;
 import jdk.jshell.SourceCodeAnalysis.Suggestion;
@@ -49,6 +50,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 class ConsoleIOContext extends IOContext {
 
@@ -236,7 +238,10 @@ class ConsoleIOContext extends IOContext {
         if (prefix.isEmpty() && buffer.trim().startsWith("/")) {
             doc = repl.commandDocumentation(buffer, cursor);
         } else {
-            doc = repl.analysis.documentation(prefix + buffer, cursor + prefix.length());
+            doc = repl.analysis.documentation(prefix + buffer, cursor + prefix.length(), false)
+                    .stream()
+                    .map(SourceCodeAnalysis.Documentation::signature)
+                    .collect(Collectors.joining("\n"));
         }
 
         try {
