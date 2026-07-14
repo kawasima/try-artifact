@@ -384,10 +384,7 @@ public class JetShellTool {
 
     private void resetState(List<String> loadList) {
         closeState();
-        pendingSealedHeader = null;
-        pendingSealedName = null;
-        pendingSubtypeSources.clear();
-        pendingSubtypeNames.clear();
+        clearPendingSealed();
         replayableHistoryPrevious = replayableHistory;
         replayableHistory = new ArrayList<>();
 
@@ -476,9 +473,11 @@ public class JetShellTool {
                 pendingSubtypeNames.add(subtypeName);
                 return false;
             }
-            // The contiguous hierarchy ended; finalise it, then route this snippet
-            // afresh (it may itself open a new sealed hierarchy).
-            boolean failed = flushPendingSealed();
+            // The contiguous hierarchy ended; finalise this one block, then route the
+            // snippet afresh -- it may open a new (possibly nested) sealed hierarchy,
+            // which subsequent snippets will feed. Single-level flush here so a nested
+            // sealed subtype's own subtypes (still incoming) are not lost.
+            boolean failed = flushOneSealedBlock();
             return routeCompleteSource(source) || failed;
         }
         String sealedName = sealedTypeNameWithoutPermits(source);
@@ -490,34 +489,61 @@ public class JetShellTool {
         return processCompleteSource(source);
     }
 
-    // Evaluates a deferred sealed declaration with a synthesised permits clause,
-    // followed by its collected subtypes. No-op when nothing is pending.
+    // Fully drains any deferred sealed hierarchy, including nested blocks. Called
+    // at input boundaries (end of input, state-observing commands, /open, /reload).
     private boolean flushPendingSealed() {
+        boolean failed = false;
+        while (pendingSealedName != null) {
+            failed |= flushOneSealedBlock();
+        }
+        return failed;
+    }
+
+    // Evaluates a single deferred sealed declaration with a synthesised permits
+    // clause, followed by its collected subtypes. Subtypes are re-routed so a nested
+    // sealed subtype gets its own permits synthesised too. No-op when nothing pends.
+    private boolean flushOneSealedBlock() {
         if (pendingSealedName == null) {
             return false;
         }
         String header = pendingSealedHeader;
         List<String> subtypeSources = new ArrayList<>(pendingSubtypeSources);
         List<String> subtypeNames = new ArrayList<>(pendingSubtypeNames);
+        clearPendingSealed();
+
+        if (state == null) {
+            // The engine was closed; nothing can be evaluated.
+            return false;
+        }
+        try {
+            if (subtypeNames.isEmpty()) {
+                // No subtypes were found; evaluate the original as-is so JShell reports
+                // the genuine error, matching plain jshell behaviour.
+                return processCompleteSource(header);
+            }
+            // Evaluate the sealed type with its synthesised permits clause. This is the
+            // form JShell records as the snippet source, so /list, /save and /reload
+            // all show the same self-contained, re-runnable declaration.
+            String sealedWithPermits = injectPermits(header, subtypeNames);
+            boolean failed = processCompleteSource(sealedWithPermits);
+            for (String subtypeSource : subtypeSources) {
+                failed |= routeCompleteSource(subtypeSource);
+            }
+            return failed;
+        } catch (IllegalStateException ex) {
+            // The engine died mid-flush; abandon any deferred state so the drain loop
+            // in flushPendingSealed terminates.
+            live = false;
+            clearPendingSealed();
+            return false;
+        }
+    }
+
+    private void clearPendingSealed() {
         pendingSealedHeader = null;
         pendingSealedName = null;
         pendingSubtypeSources.clear();
         pendingSubtypeNames.clear();
-
-        if (subtypeNames.isEmpty()) {
-            // No subtypes were found; evaluate the original as-is so JShell reports
-            // the genuine error, matching plain jshell behaviour.
-            return processCompleteSource(header);
-        }
-        // Evaluate the sealed type with its synthesised permits clause. This is the
-        // form JShell records as the snippet source, so /list, /save and /reload all
-        // show the same self-contained, re-runnable declaration.
-        String sealedWithPermits = injectPermits(header, subtypeNames);
-        boolean failed = processCompleteSource(sealedWithPermits);
-        for (String subtypeSource : subtypeSources) {
-            failed |= processCompleteSource(subtypeSource);
-        }
-        return failed;
     }
 
     private boolean processCompleteSource(String source) {
@@ -540,9 +566,15 @@ public class JetShellTool {
 
     // --- Sealed-type deferral helpers (Issue #17) ---
 
-    private static final java.util.regex.Pattern TYPE_NAME =
-            java.util.regex.Pattern.compile("\\b(?:class|interface|record|enum)\\s+([A-Za-z_$][\\w$]*)");
-    private static final java.util.regex.Pattern SEALED_KW = java.util.regex.Pattern.compile("\\bsealed\\b");
+    // Anchored type-declaration matcher: leading annotations/modifiers, then the
+    // kind keyword (group 1) and the declared name (group 2). Anchoring to the
+    // start avoids matching keywords that appear inside string literals or comments.
+    private static final java.util.regex.Pattern TYPE_DECL = java.util.regex.Pattern.compile(
+            "^\\s*(?:@[\\w.]+(?:\\s*\\([^)]*\\))?\\s+"
+            + "|(?:public|protected|private|abstract|static|final|strictfp|sealed|non-sealed)\\s+)*"
+            + "(class|interface|record|enum)\\s+([A-Za-z_$][\\w$]*)");
+    // `sealed` as a modifier -- the negative lookbehind excludes the `non-sealed` keyword.
+    private static final java.util.regex.Pattern SEALED_MOD = java.util.regex.Pattern.compile("(?<!-)\\bsealed\\b");
     private static final java.util.regex.Pattern PERMITS_KW = java.util.regex.Pattern.compile("\\bpermits\\b");
     private static final java.util.regex.Pattern SUPERTYPE_KW =
             java.util.regex.Pattern.compile("\\b(?:extends|implements)\\b");
@@ -556,23 +588,56 @@ public class JetShellTool {
     // with no explicit `permits` clause; otherwise null.
     private static String sealedTypeNameWithoutPermits(String source) {
         String header = declHeader(source);
-        if (!SEALED_KW.matcher(header).find() || PERMITS_KW.matcher(header).find()) {
+        java.util.regex.Matcher decl = TYPE_DECL.matcher(header);
+        if (!decl.find()) {
             return null;
         }
-        java.util.regex.Matcher m = TYPE_NAME.matcher(header);
-        return m.find() ? m.group(1) : null;
+        String kind = decl.group(1);
+        if (!kind.equals("class") && !kind.equals("interface")) {
+            return null;
+        }
+        String modifiers = header.substring(0, decl.start(1));
+        if (!SEALED_MOD.matcher(modifiers).find() || PERMITS_KW.matcher(header).find()) {
+            return null;
+        }
+        return decl.group(2);
     }
 
     // Returns the declared type name if the snippet extends/implements `superName`
-    // (so it belongs in that sealed type's permits clause); otherwise null.
+    // as a direct supertype (so it belongs in that sealed type's permits clause);
+    // otherwise null. Generic type arguments are ignored, so a type that merely
+    // mentions the sealed type inside e.g. Iterable<Shape> is not treated as a subtype.
     private static String subtypeNameIfExtends(String source, String superName) {
         String header = declHeader(source);
-        java.util.regex.Matcher kw = SUPERTYPE_KW.matcher(header);
-        if (!kw.find() || !containsWord(header.substring(kw.start()), superName)) {
+        java.util.regex.Matcher decl = TYPE_DECL.matcher(header);
+        if (!decl.find()) {
             return null;
         }
-        java.util.regex.Matcher m = TYPE_NAME.matcher(header);
-        return m.find() ? m.group(1) : null;
+        java.util.regex.Matcher kw = SUPERTYPE_KW.matcher(header.substring(decl.end()));
+        if (!kw.find()) {
+            return null;
+        }
+        String supertypes = stripGenerics(header.substring(decl.end()).substring(kw.start()));
+        return containsWord(supertypes, superName) ? decl.group(2) : null;
+    }
+
+    // Removes the contents of balanced angle-bracket groups (generic arguments).
+    private static String stripGenerics(String text) {
+        StringBuilder sb = new StringBuilder(text.length());
+        int depth = 0;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '<') {
+                depth++;
+            } else if (c == '>') {
+                if (depth > 0) {
+                    depth--;
+                }
+            } else if (depth == 0) {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
     }
 
     // Inserts `permits A, B, ...` immediately before the type body.
@@ -789,10 +854,17 @@ public class JetShellTool {
 
     // --- Command processing ---
 
+    // Commands that neither read nor replay snippet state. For these we leave a
+    // deferred sealed-type hierarchy pending so the user can keep declaring its
+    // subtypes; every other command finalises the hierarchy first (it may observe
+    // the resulting snippets). See Issue #17.
+    private static final Set<String> NON_STATE_COMMANDS =
+            Set.of("/help", "/classpath", "/resolve", "/deps", "/doc", "/source");
+
     private void processCommand(String cmd) {
-        // A command boundary finalises any deferred sealed-type hierarchy.
-        flushPendingSealed();
         if (cmd.startsWith("/-")) {
+            // Re-running a history entry depends on the current snippet state.
+            flushPendingSealed();
             try {
                 cmdUseHistoryEntry(Integer.parseInt(cmd.substring(1)));
                 return;
@@ -820,6 +892,9 @@ public class JetShellTool {
                         Arrays.stream(matches).map(c -> c.command).collect(Collectors.joining(", ")));
                 return;
             }
+        }
+        if (!NON_STATE_COMMANDS.contains(command.command)) {
+            flushPendingSealed();
         }
         boolean handled = command.run.handle(arg);
         if (handled && command.kind == CommandKind.REPLAY) {

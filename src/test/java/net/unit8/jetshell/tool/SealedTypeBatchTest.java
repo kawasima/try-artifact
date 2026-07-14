@@ -69,4 +69,49 @@ public class SealedTypeBatchTest {
         assertTrue(output.contains("Expression value is: 7"),
                 "sealed class subclasses should be usable. Output:\n" + output);
     }
+
+    // Finding #1: a following type that merely mentions the sealed type inside a
+    // generic supertype argument must NOT be pulled into the permits clause.
+    public void unrelatedTypeMentioningSealedInGenericsIsNotPermitted() throws Exception {
+        String output = run(
+                "sealed interface Shape {}\n" +
+                "record Circle(double radius) implements Shape {}\n" +
+                "record Rect(double width, double height) implements Shape {}\n" +
+                // Iterable<Shape>: Shape appears only as a type argument, not as a supertype.
+                "class ShapeBag implements Iterable<Shape> {\n" +
+                "  public java.util.Iterator<Shape> iterator() { return java.util.List.<Shape>of().iterator(); }\n" +
+                "}\n" +
+                "new Circle(3.0).radius()\n" +
+                "/exit\n");
+        assertTrue(output.contains("Expression value is: 3.0"),
+                "The sealed hierarchy must compile; ShapeBag must not join its permits. Output:\n" + output);
+    }
+
+    // Finding #2: a nested sealed type (itself a subtype) must also be deferred and
+    // given a synthesised permits clause, not evaluated as-is.
+    public void nestedSealedHierarchyCompiles() throws Exception {
+        String output = run(
+                "sealed interface Shape {}\n" +
+                "sealed interface Poly extends Shape {}\n" +
+                "record Tri() implements Poly {}\n" +
+                "record Quad() implements Poly {}\n" +
+                "new Tri()\n" +
+                "/exit\n");
+        assertTrue(output.contains("Expression value is: Tri[]"),
+                "Nested sealed hierarchy should compile end to end. Output:\n" + output);
+    }
+
+    // Finding #4: a `non-sealed` subtype must not be misread as a sealed declaration,
+    // and a string literal containing declaration-like text must not derail parsing.
+    public void nonSealedSubtypeAndStringLiteralAreHandled() throws Exception {
+        String output = run(
+                "String note = \"sealed interface Ghost {}\";\n" +
+                "sealed interface Shape {}\n" +
+                "non-sealed interface Openable extends Shape {}\n" +
+                "record Circle(double radius) implements Shape {}\n" +
+                "new Circle(4.0).radius()\n" +
+                "/exit\n");
+        assertTrue(output.contains("Expression value is: 4.0"),
+                "non-sealed subtype and string literal must not break the hierarchy. Output:\n" + output);
+    }
 }
