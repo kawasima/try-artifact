@@ -473,7 +473,7 @@ public class JetShellTool {
                 pendingSubtypeNames.add(subtypeName);
                 return false;
             }
-            if (isBlankOrCommentOnly(source) || isImport(source)) {
+            if (isTransparentToPendingHierarchy(source)) {
                 // A comment, blank or import snippet between the sealed type and its
                 // subtypes must not finalise the hierarchy; evaluate it and keep going.
                 return processCompleteSource(source);
@@ -665,28 +665,42 @@ public class JetShellTool {
         return beforeBody + " permits " + String.join(", ", subtypeNames) + " " + body;
     }
 
-    // True if `word` appears in `text` as an unqualified type reference -- a whole
-    // word not preceded by a dot, so a qualified name like java.rmi.Remote does not
-    // count as a reference to a local `Remote`.
+    // True if `word` appears in `text` as a whole, unqualified type reference: not
+    // adjoined to an identifier character or a dot on either side. This excludes both
+    // a qualified name whose tail is `word` (java.rmi.Remote) and a nested type whose
+    // qualifier is `word` (Shape.Marker), neither of which refers to a local `word`.
     private static boolean mentionsUnqualified(String text, String word) {
-        return java.util.regex.Pattern.compile("(?<![.\\w$])" + java.util.regex.Pattern.quote(word) + "\\b")
-                .matcher(text).find();
+        int from = 0;
+        while (true) {
+            int idx = text.indexOf(word, from);
+            if (idx < 0) {
+                return false;
+            }
+            boolean boundedBefore = idx == 0 || !isReferenceChar(text.charAt(idx - 1));
+            int after = idx + word.length();
+            boolean boundedAfter = after == text.length() || !isReferenceChar(text.charAt(after));
+            if (boundedBefore && boundedAfter) {
+                return true;
+            }
+            from = idx + 1;
+        }
     }
 
-    // True if the snippet contains nothing but comments and whitespace, so it must
-    // be transparent to a pending sealed hierarchy rather than finalising it.
-    private static boolean isBlankOrCommentOnly(String source) {
-        return stripComments(source).isBlank();
+    private static boolean isReferenceChar(char c) {
+        return c == '.' || Character.isJavaIdentifierPart(c);
     }
 
     private static final java.util.regex.Pattern IMPORT_STMT =
             java.util.regex.Pattern.compile("^\\s*import\\b");
 
-    // True if the snippet is an import statement. Imports are order-independent and,
-    // unlike in a single .java file, JShell allows them anywhere, so an interleaved
-    // import must stay transparent to a pending sealed hierarchy.
-    private static boolean isImport(String source) {
-        return IMPORT_STMT.matcher(stripComments(source)).find();
+    // True if the snippet is transparent to a pending sealed hierarchy: nothing but
+    // comments/whitespace, or an import. Imports are order-independent and, unlike in
+    // a single .java file, JShell allows them anywhere, so an interleaved import (or a
+    // stray comment between declarations) must not finalise the hierarchy. Strips
+    // comments once and reuses the result for both checks.
+    private static boolean isTransparentToPendingHierarchy(String source) {
+        String stripped = stripComments(source);
+        return stripped.isBlank() || IMPORT_STMT.matcher(stripped).find();
     }
 
     // Removes line and block comments, while preserving string, char and text-block
@@ -697,49 +711,19 @@ public class JetShellTool {
         int i = 0;
         int n = src.length();
         while (i < n) {
-            char c = src.charAt(i);
-            if (c == '/' && i + 1 < n && src.charAt(i + 1) == '/') {
-                i += 2;
-                while (i < n && src.charAt(i) != '\n') {
-                    i++;
-                }
-            } else if (c == '/' && i + 1 < n && src.charAt(i + 1) == '*') {
-                i += 2;
-                while (i + 1 < n && !(src.charAt(i) == '*' && src.charAt(i + 1) == '/')) {
-                    i++;
-                }
-                i += 2;
-            } else if (isTextBlockStart(src, i)) {
-                sb.append("\"\"\"");
-                i += 3;
-                while (i < n && !isTextBlockStart(src, i)) {
-                    sb.append(src.charAt(i));
-                    i++;
-                }
-                if (i < n) {
-                    sb.append("\"\"\"");
-                    i += 3;
-                }
-            } else if (c == '"' || c == '\'') {
-                sb.append(c);
-                i++;
-                while (i < n && src.charAt(i) != c) {
-                    sb.append(src.charAt(i));
-                    if (src.charAt(i) == '\\' && i + 1 < n) {
-                        sb.append(src.charAt(i + 1));
-                        i += 2;
-                    } else {
-                        i++;
-                    }
-                }
-                if (i < n) {
-                    sb.append(c);
-                    i++;
-                }
-            } else {
-                sb.append(c);
-                i++;
+            int afterComment = commentEnd(src, i);
+            if (afterComment != i) {
+                i = afterComment;
+                continue;
             }
+            int afterLiteral = literalEnd(src, i);
+            if (afterLiteral != i) {
+                sb.append(src, i, afterLiteral);
+                i = afterLiteral;
+                continue;
+            }
+            sb.append(src.charAt(i));
+            i++;
         }
         return sb.toString();
     }
@@ -757,51 +741,16 @@ public class JetShellTool {
                 return i;
             } else if (c == '(') {
                 i = skipParens(src, i);
-            } else if (c == '/' && i + 1 < n && src.charAt(i + 1) == '/') {
-                i += 2;
-                while (i < n && src.charAt(i) != '\n') {
-                    i++;
-                }
-            } else if (c == '/' && i + 1 < n && src.charAt(i + 1) == '*') {
-                i += 2;
-                while (i + 1 < n && !(src.charAt(i) == '*' && src.charAt(i + 1) == '/')) {
-                    i++;
-                }
-                i += 2;
-            } else if (isTextBlockStart(src, i)) {
-                i += 3;
-                while (i < n && !isTextBlockStart(src, i)) {
-                    i++;
-                }
-                i += 3;
-            } else if (c == '"' || c == '\'') {
-                i = skipQuoted(src, i);
-            } else {
-                i++;
+                continue;
             }
+            int next = skipNoise(src, i);
+            i = (next != i) ? next : i + 1;
         }
         return -1;
     }
 
-    private static boolean isTextBlockStart(String src, int i) {
-        return i + 2 < src.length()
-                && src.charAt(i) == '"' && src.charAt(i + 1) == '"' && src.charAt(i + 2) == '"';
-    }
-
-    // Given the index of an opening quote, returns the index just past the closing
-    // quote (escapes respected). Used to skip string and char literals.
-    private static int skipQuoted(String src, int open) {
-        char q = src.charAt(open);
-        int i = open + 1;
-        int n = src.length();
-        while (i < n && src.charAt(i) != q) {
-            i += (src.charAt(i) == '\\' && i + 1 < n) ? 2 : 1;
-        }
-        return i < n ? i + 1 : i;
-    }
-
     // Given the index of an opening '(', returns the index just past the matching
-    // ')', tracking nested parens and skipping string/char literals (so an arg such
+    // ')', tracking nested parens and skipping comments and literals (so an arg such
     // as ")" or {"a"} is consumed correctly). Returns the length if unbalanced.
     private static int skipParens(String src, int open) {
         int depth = 0;
@@ -809,9 +758,7 @@ public class JetShellTool {
         int n = src.length();
         while (i < n) {
             char c = src.charAt(i);
-            if (c == '"' || c == '\'') {
-                i = skipQuoted(src, i);
-            } else if (c == '(') {
+            if (c == '(') {
                 depth++;
                 i++;
             } else if (c == ')') {
@@ -821,10 +768,69 @@ public class JetShellTool {
                     return i;
                 }
             } else {
-                i++;
+                int next = skipNoise(src, i);
+                i = (next != i) ? next : i + 1;
             }
         }
         return n;
+    }
+
+    // If a comment or a string/char/text-block literal starts at i, returns the index
+    // just past it; otherwise returns i unchanged.
+    private static int skipNoise(String src, int i) {
+        int afterComment = commentEnd(src, i);
+        if (afterComment != i) {
+            return afterComment;
+        }
+        return literalEnd(src, i);
+    }
+
+    // If a line or block comment starts at i, returns the index just past it;
+    // otherwise returns i.
+    private static int commentEnd(String src, int i) {
+        int n = src.length();
+        if (i + 1 < n && src.charAt(i) == '/' && src.charAt(i + 1) == '/') {
+            i += 2;
+            while (i < n && src.charAt(i) != '\n') {
+                i++;
+            }
+            return i;
+        }
+        if (i + 1 < n && src.charAt(i) == '/' && src.charAt(i + 1) == '*') {
+            i += 2;
+            while (i + 1 < n && !(src.charAt(i) == '*' && src.charAt(i + 1) == '/')) {
+                i++;
+            }
+            return Math.min(i + 2, n);
+        }
+        return i;
+    }
+
+    // If a string, char or text-block literal starts at i, returns the index just
+    // past it (escapes respected); otherwise returns i.
+    private static int literalEnd(String src, int i) {
+        int n = src.length();
+        if (isTextBlockStart(src, i)) {
+            i += 3;
+            while (i < n && !isTextBlockStart(src, i)) {
+                i++;
+            }
+            return Math.min(i + 3, n);
+        }
+        char c = src.charAt(i);
+        if (c == '"' || c == '\'') {
+            i++;
+            while (i < n && src.charAt(i) != c) {
+                i += (src.charAt(i) == '\\' && i + 1 < n) ? 2 : 1;
+            }
+            return i < n ? i + 1 : i;
+        }
+        return i;
+    }
+
+    private static boolean isTextBlockStart(String src, int i) {
+        return i + 2 < src.length()
+                && src.charAt(i) == '"' && src.charAt(i + 1) == '"' && src.charAt(i + 2) == '"';
     }
 
     // Removes annotations (@Name and @Name(...)) from a declaration header so the

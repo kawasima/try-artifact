@@ -233,4 +233,18 @@ public class SealedTypeBatchTest {
         assertTrue(output.contains("Expression value is: 3.0"),
                 "Braces in an annotation array must not be read as the type body. Output:\n" + output);
     }
+
+    // Review: a type implementing a NESTED type of the sealed type (Shape.Marker)
+    // must not be treated as a subtype of the outer sealed type.
+    public void subtypeOfNestedTypeIsNotPermittedOnOuter() throws Exception {
+        String output = run(
+                "sealed interface Shape { interface Marker {} }\n" +
+                "record Circle(double radius) implements Shape {}\n" +
+                // Tag implements Shape.Marker, NOT Shape.
+                "class Tag implements Shape.Marker {}\n" +
+                "new Circle(2.0).radius()\n" +
+                "/exit\n");
+        assertTrue(output.contains("Expression value is: 2.0"),
+                "Tag (Shape.Marker) must not join the outer Shape's permits. Output:\n" + output);
+    }
 }
