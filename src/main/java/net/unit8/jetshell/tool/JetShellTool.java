@@ -48,6 +48,16 @@ public class JetShellTool {
     private boolean suppressOutput = false;
     private boolean hadFailure = false;
 
+    // A sealed interface/class whose permitted subtypes are declared on later lines
+    // cannot compile as its own JShell compilation unit (no permits, no same-unit
+    // subtypes). We defer such a declaration, collect the contiguous subtype
+    // declarations that follow, then synthesise an explicit permits clause so the
+    // whole hierarchy compiles -- the same way it would as a single .java file.
+    private String pendingSealedHeader;
+    private String pendingSealedName;
+    private final List<String> pendingSubtypeSources = new ArrayList<>();
+    private final List<String> pendingSubtypeNames = new ArrayList<>();
+
     public boolean testPrompt = false;
 
     boolean hadFailure() {
@@ -316,6 +326,7 @@ public class JetShellTool {
                 }
                 incomplete = processInput(raw, incomplete);
             }
+            flushPendingSealed();
         } catch (Exception ex) {
             hard("Unexpected exception: %s", ex);
             hadFailure = true;
@@ -336,6 +347,7 @@ public class JetShellTool {
             }
             incomplete = processInput(raw, incomplete);
         }
+        flushPendingSealed();
     }
 
     private String processInput(String raw, String incomplete) {
@@ -372,6 +384,10 @@ public class JetShellTool {
 
     private void resetState(List<String> loadList) {
         closeState();
+        pendingSealedHeader = null;
+        pendingSealedName = null;
+        pendingSubtypeSources.clear();
+        pendingSubtypeNames.clear();
         replayableHistoryPrevious = replayableHistory;
         replayableHistory = new ArrayList<>();
 
@@ -401,6 +417,7 @@ public class JetShellTool {
         if (!start.isBlank()) {
             suppressOutput = true;
             processSource(start);
+            flushPendingSealed();
             suppressOutput = false;
             // Record snippet IDs that belong to startup so /list start can filter them
             startupSnippetIds = state.snippets()
@@ -441,12 +458,66 @@ public class JetShellTool {
             if (!an.completeness().isComplete()) {
                 return an.remaining();
             }
-            boolean failed = processCompleteSource(an.source());
+            boolean failed = routeCompleteSource(an.source());
             if (failed || an.remaining().isEmpty()) {
                 return "";
             }
             srcInput = an.remaining();
         }
+    }
+
+    // Routes a complete snippet, deferring a sealed-type hierarchy so an explicit
+    // permits clause can be synthesised once its subtypes are known (see Issue #17).
+    private boolean routeCompleteSource(String source) {
+        if (pendingSealedName != null) {
+            String subtypeName = subtypeNameIfExtends(source, pendingSealedName);
+            if (subtypeName != null) {
+                pendingSubtypeSources.add(source);
+                pendingSubtypeNames.add(subtypeName);
+                return false;
+            }
+            // The contiguous hierarchy ended; finalise it, then route this snippet
+            // afresh (it may itself open a new sealed hierarchy).
+            boolean failed = flushPendingSealed();
+            return routeCompleteSource(source) || failed;
+        }
+        String sealedName = sealedTypeNameWithoutPermits(source);
+        if (sealedName != null) {
+            pendingSealedHeader = source;
+            pendingSealedName = sealedName;
+            return false;
+        }
+        return processCompleteSource(source);
+    }
+
+    // Evaluates a deferred sealed declaration with a synthesised permits clause,
+    // followed by its collected subtypes. No-op when nothing is pending.
+    private boolean flushPendingSealed() {
+        if (pendingSealedName == null) {
+            return false;
+        }
+        String header = pendingSealedHeader;
+        List<String> subtypeSources = new ArrayList<>(pendingSubtypeSources);
+        List<String> subtypeNames = new ArrayList<>(pendingSubtypeNames);
+        pendingSealedHeader = null;
+        pendingSealedName = null;
+        pendingSubtypeSources.clear();
+        pendingSubtypeNames.clear();
+
+        if (subtypeNames.isEmpty()) {
+            // No subtypes were found; evaluate the original as-is so JShell reports
+            // the genuine error, matching plain jshell behaviour.
+            return processCompleteSource(header);
+        }
+        // Evaluate the sealed type with its synthesised permits clause. This is the
+        // form JShell records as the snippet source, so /list, /save and /reload all
+        // show the same self-contained, re-runnable declaration.
+        String sealedWithPermits = injectPermits(header, subtypeNames);
+        boolean failed = processCompleteSource(sealedWithPermits);
+        for (String subtypeSource : subtypeSources) {
+            failed |= processCompleteSource(subtypeSource);
+        }
+        return failed;
     }
 
     private boolean processCompleteSource(String source) {
@@ -465,6 +536,59 @@ public class JetShellTool {
             replayableHistory.add(source);
         }
         return failed;
+    }
+
+    // --- Sealed-type deferral helpers (Issue #17) ---
+
+    private static final java.util.regex.Pattern TYPE_NAME =
+            java.util.regex.Pattern.compile("\\b(?:class|interface|record|enum)\\s+([A-Za-z_$][\\w$]*)");
+    private static final java.util.regex.Pattern SEALED_KW = java.util.regex.Pattern.compile("\\bsealed\\b");
+    private static final java.util.regex.Pattern PERMITS_KW = java.util.regex.Pattern.compile("\\bpermits\\b");
+    private static final java.util.regex.Pattern SUPERTYPE_KW =
+            java.util.regex.Pattern.compile("\\b(?:extends|implements)\\b");
+
+    private static String declHeader(String source) {
+        int brace = source.indexOf('{');
+        return brace >= 0 ? source.substring(0, brace) : source;
+    }
+
+    // Returns the declared type name if the snippet is a `sealed` interface/class
+    // with no explicit `permits` clause; otherwise null.
+    private static String sealedTypeNameWithoutPermits(String source) {
+        String header = declHeader(source);
+        if (!SEALED_KW.matcher(header).find() || PERMITS_KW.matcher(header).find()) {
+            return null;
+        }
+        java.util.regex.Matcher m = TYPE_NAME.matcher(header);
+        return m.find() ? m.group(1) : null;
+    }
+
+    // Returns the declared type name if the snippet extends/implements `superName`
+    // (so it belongs in that sealed type's permits clause); otherwise null.
+    private static String subtypeNameIfExtends(String source, String superName) {
+        String header = declHeader(source);
+        java.util.regex.Matcher kw = SUPERTYPE_KW.matcher(header);
+        if (!kw.find() || !containsWord(header.substring(kw.start()), superName)) {
+            return null;
+        }
+        java.util.regex.Matcher m = TYPE_NAME.matcher(header);
+        return m.find() ? m.group(1) : null;
+    }
+
+    // Inserts `permits A, B, ...` immediately before the type body.
+    private static String injectPermits(String header, List<String> subtypeNames) {
+        int brace = header.indexOf('{');
+        if (brace < 0) {
+            return header;
+        }
+        String beforeBody = header.substring(0, brace).stripTrailing();
+        String body = header.substring(brace);
+        return beforeBody + " permits " + String.join(", ", subtypeNames) + " " + body;
+    }
+
+    private static boolean containsWord(String text, String word) {
+        return java.util.regex.Pattern.compile("\\b" + java.util.regex.Pattern.quote(word) + "\\b")
+                .matcher(text).find();
     }
 
     private boolean handleEvent(SnippetEvent ste) {
@@ -666,6 +790,8 @@ public class JetShellTool {
     // --- Command processing ---
 
     private void processCommand(String cmd) {
+        // A command boundary finalises any deferred sealed-type hierarchy.
+        flushPendingSealed();
         if (cmd.startsWith("/-")) {
             try {
                 cmdUseHistoryEntry(Integer.parseInt(cmd.substring(1)));
@@ -969,6 +1095,7 @@ public class JetShellTool {
         try {
             String content = Files.readString(toPathResolvingUserHome(filename));
             processSource(content);
+            flushPendingSealed();
         } catch (IOException e) {
             error("File '%s' not found: %s", filename, e.getMessage());
         }
@@ -1025,6 +1152,7 @@ public class JetShellTool {
             }
             processSource(source);
         }
+        flushPendingSealed();
     }
 
     private void cmdClasspath(String arg) {
