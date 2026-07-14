@@ -48,6 +48,41 @@ public class JetShellTool {
     private boolean suppressOutput = false;
     private boolean hadFailure = false;
 
+    // Batch output verbosity, selected by -plain / -quiet (see Issue #12). Each mode
+    // carries its whole policy so it lives in one table (cf. CommandKind below):
+    //   prefix        -- prepended to every line ("|  " only interactively).
+    //   mutesInfo     -- hard() informational output is suppressed.
+    //   errorsToStderr-- problem() diagnostics go to stderr instead of stdout.
+    //   showsPrompt   -- the input prompt is emitted.
+    enum OutputMode {
+        NORMAL("|  ", false, false, true),
+        PLAIN("", false, false, false),
+        QUIET("", true, true, false);
+
+        final String prefix;
+        final boolean mutesInfo;
+        final boolean errorsToStderr;
+        final boolean showsPrompt;
+
+        OutputMode(String prefix, boolean mutesInfo, boolean errorsToStderr, boolean showsPrompt) {
+            this.prefix = prefix;
+            this.mutesInfo = mutesInfo;
+            this.errorsToStderr = errorsToStderr;
+            this.showsPrompt = showsPrompt;
+        }
+    }
+    private OutputMode outputMode = OutputMode.NORMAL;
+
+    // A sealed interface/class whose permitted subtypes are declared on later lines
+    // cannot compile as its own JShell compilation unit (no permits, no same-unit
+    // subtypes). We defer such a declaration, collect the contiguous subtype
+    // declarations that follow, then synthesise an explicit permits clause so the
+    // whole hierarchy compiles -- the same way it would as a single .java file.
+    private String pendingSealedHeader;
+    private String pendingSealedName;
+    private final List<String> pendingSubtypeSources = new ArrayList<>();
+    private final List<String> pendingSubtypeNames = new ArrayList<>();
+
     public boolean testPrompt = false;
 
     boolean hadFailure() {
@@ -110,15 +145,32 @@ public class JetShellTool {
 
     // --- Output helpers ---
 
+    private void emit(PrintStream stream, String format, Object... args) {
+        stream.printf(outputMode.prefix + format + "%n", args);
+    }
+
+    // Informational output (declarations, expression values, banners). Muted during
+    // startup and entirely in QUIET mode.
     public void hard(String format, Object... args) {
-        if (!suppressOutput) {
-            cmdout.printf("|  " + format + "%n", args);
+        if (suppressOutput || outputMode.mutesInfo) {
+            return;
         }
+        emit(cmdout, format, args);
+    }
+
+    // Snippet compile/runtime error output. Stays on stdout in NORMAL/PLAIN (as it
+    // always has), but is redirected to stderr in QUIET so it survives the silenced
+    // stdout. Muted during startup, like hard(), so start-up noise stays hidden.
+    public void problem(String format, Object... args) {
+        if (suppressOutput) {
+            return;
+        }
+        emit(outputMode.errorsToStderr ? cmderr : cmdout, format, args);
     }
 
     public void error(String format, Object... args) {
         // Errors are always shown, even during startup (suppressOutput only mutes normal output)
-        cmderr.printf("|  " + format + "%n", args);
+        emit(cmderr, format, args);
     }
 
     public void fluff(String format, Object... args) {
@@ -292,7 +344,7 @@ public class JetShellTool {
                 runWithReader(reader);
             }
         } catch (IOException ex) {
-            hard("Unexpected exception: %s", ex);
+            problem("Unexpected exception: %s", ex);
             hadFailure = true;
         } finally {
             closeState();
@@ -303,7 +355,9 @@ public class JetShellTool {
         String incomplete = "";
         try {
             while (live) {
-                String prompt = incomplete.isEmpty() ? "\n-> " : ">> ";
+                // -plain / -quiet drop the prompt so batch output stays machine-clean.
+                String prompt = !outputMode.showsPrompt ? ""
+                        : incomplete.isEmpty() ? "\n-> " : ">> ";
                 String raw;
                 try {
                     raw = lineReader.readLine(prompt);
@@ -316,8 +370,9 @@ public class JetShellTool {
                 }
                 incomplete = processInput(raw, incomplete);
             }
+            flushPendingSealed();
         } catch (Exception ex) {
-            hard("Unexpected exception: %s", ex);
+            problem("Unexpected exception: %s", ex);
             hadFailure = true;
         }
     }
@@ -325,9 +380,11 @@ public class JetShellTool {
     private void runWithReader(BufferedReader reader) throws IOException {
         String incomplete = "";
         while (live) {
-            String prompt = incomplete.isEmpty() ? "\u0005" : "\u0006";
-            console.print(prompt);
-            console.flush();
+            // -plain / -quiet drop the prompt so batch output stays machine-clean.
+            if (outputMode.showsPrompt) {
+                console.print(incomplete.isEmpty() ? "\u0005" : "\u0006");
+                console.flush();
+            }
 
             String raw = reader.readLine();
             if (raw == null) {
@@ -336,6 +393,7 @@ public class JetShellTool {
             }
             incomplete = processInput(raw, incomplete);
         }
+        flushPendingSealed();
     }
 
     private String processInput(String raw, String incomplete) {
@@ -372,6 +430,7 @@ public class JetShellTool {
 
     private void resetState(List<String> loadList) {
         closeState();
+        clearPendingSealed();
         replayableHistoryPrevious = replayableHistory;
         replayableHistory = new ArrayList<>();
 
@@ -401,6 +460,7 @@ public class JetShellTool {
         if (!start.isBlank()) {
             suppressOutput = true;
             processSource(start);
+            flushPendingSealed();
             suppressOutput = false;
             // Record snippet IDs that belong to startup so /list start can filter them
             startupSnippetIds = state.snippets()
@@ -441,12 +501,100 @@ public class JetShellTool {
             if (!an.completeness().isComplete()) {
                 return an.remaining();
             }
-            boolean failed = processCompleteSource(an.source());
+            boolean failed = routeCompleteSource(an.source());
             if (failed || an.remaining().isEmpty()) {
                 return "";
             }
             srcInput = an.remaining();
         }
+    }
+
+    // Routes a complete snippet, deferring a sealed-type hierarchy so an explicit
+    // permits clause can be synthesised once its subtypes are known (see Issue #17).
+    private boolean routeCompleteSource(String source) {
+        if (pendingSealedName != null) {
+            String subtypeName = subtypeNameIfExtends(source, pendingSealedName);
+            if (subtypeName != null) {
+                pendingSubtypeSources.add(source);
+                pendingSubtypeNames.add(subtypeName);
+                return false;
+            }
+            if (isTransparentToPendingHierarchy(source)) {
+                // A comment, blank or import snippet between the sealed type and its
+                // subtypes must not finalise the hierarchy; evaluate it and keep going.
+                return processCompleteSource(source);
+            }
+            // The contiguous hierarchy ended; finalise this one block, then route the
+            // snippet afresh -- it may open a new (possibly nested) sealed hierarchy,
+            // which subsequent snippets will feed. Single-level flush here so a nested
+            // sealed subtype's own subtypes (still incoming) are not lost.
+            boolean failed = flushOneSealedBlock();
+            return routeCompleteSource(source) || failed;
+        }
+        String sealedName = sealedTypeNameWithoutPermits(source);
+        if (sealedName != null) {
+            pendingSealedHeader = source;
+            pendingSealedName = sealedName;
+            return false;
+        }
+        return processCompleteSource(source);
+    }
+
+    // Fully drains any deferred sealed hierarchy, including nested blocks. Called
+    // at input boundaries (end of input, state-observing commands, /open, /reload).
+    private boolean flushPendingSealed() {
+        boolean failed = false;
+        while (pendingSealedName != null) {
+            failed |= flushOneSealedBlock();
+        }
+        return failed;
+    }
+
+    // Evaluates a single deferred sealed declaration with a synthesised permits
+    // clause, followed by its collected subtypes. Subtypes are re-routed so a nested
+    // sealed subtype gets its own permits synthesised too. No-op when nothing pends.
+    private boolean flushOneSealedBlock() {
+        if (pendingSealedName == null) {
+            return false;
+        }
+        String header = pendingSealedHeader;
+        List<String> subtypeSources = new ArrayList<>(pendingSubtypeSources);
+        List<String> subtypeNames = new ArrayList<>(pendingSubtypeNames);
+        clearPendingSealed();
+
+        if (state == null) {
+            // The engine was closed; nothing can be evaluated.
+            return false;
+        }
+        try {
+            if (subtypeNames.isEmpty()) {
+                // No subtypes were found; evaluate the original as-is so JShell reports
+                // the genuine error, matching plain jshell behaviour.
+                return processCompleteSource(header);
+            }
+            // Evaluate the sealed type with its synthesised permits clause. This is the
+            // form JShell records as the snippet source, so /list, /save and /reload
+            // all show the same self-contained, re-runnable declaration.
+            String sealedWithPermits = injectPermits(header, subtypeNames);
+            boolean failed = processCompleteSource(sealedWithPermits);
+            for (String subtypeSource : subtypeSources) {
+                failed |= routeCompleteSource(subtypeSource);
+            }
+            return failed;
+        } catch (IllegalStateException ex) {
+            // The engine died mid-flush; abandon any deferred state so the drain loop
+            // in flushPendingSealed terminates.
+            live = false;
+            clearPendingSealed();
+            return false;
+        }
+    }
+
+    private void clearPendingSealed() {
+        pendingSealedHeader = null;
+        pendingSealedName = null;
+        pendingSubtypeSources.clear();
+        pendingSubtypeNames.clear();
     }
 
     private boolean processCompleteSource(String source) {
@@ -465,6 +613,301 @@ public class JetShellTool {
             replayableHistory.add(source);
         }
         return failed;
+    }
+
+    // --- Sealed-type deferral helpers (Issue #17) ---
+
+    // Anchored type-declaration matcher: leading modifiers, then the kind keyword
+    // (group 1) and the declared name (group 2). Annotations are removed by
+    // stripAnnotations before matching, and anchoring to the start avoids matching
+    // keywords that appear inside string literals or comments.
+    private static final java.util.regex.Pattern TYPE_DECL = java.util.regex.Pattern.compile(
+            "^\\s*(?:(?:public|protected|private|abstract|static|final|strictfp|sealed|non-sealed)\\s+)*"
+            + "(class|interface|record|enum)\\s+([A-Za-z_$][\\w$]*)");
+    // `sealed` as a modifier -- the negative lookbehind excludes the `non-sealed` keyword.
+    private static final java.util.regex.Pattern SEALED_MOD = java.util.regex.Pattern.compile("(?<!-)\\bsealed\\b");
+    private static final java.util.regex.Pattern PERMITS_KW = java.util.regex.Pattern.compile("\\bpermits\\b");
+    private static final java.util.regex.Pattern SUPERTYPE_KW =
+            java.util.regex.Pattern.compile("\\b(?:extends|implements)\\b");
+
+    // The declaration prefix (before the body). The body brace is located while
+    // skipping comments and string literals (so a brace inside either is not taken
+    // for the body), then comments are removed so a leading comment -- which
+    // analyzeCompletion prepends to the following snippet -- does not defeat the
+    // start-anchored declaration matcher.
+    private static String declHeader(String source) {
+        int brace = bodyBraceIndex(source);
+        String prefix = brace >= 0 ? source.substring(0, brace) : source;
+        return stripAnnotations(stripComments(prefix));
+    }
+
+    // Returns the declared type name if the snippet is a `sealed` interface/class
+    // with no explicit `permits` clause; otherwise null.
+    private static String sealedTypeNameWithoutPermits(String source) {
+        String header = declHeader(source);
+        java.util.regex.Matcher decl = TYPE_DECL.matcher(header);
+        if (!decl.find()) {
+            return null;
+        }
+        String kind = decl.group(1);
+        if (!kind.equals("class") && !kind.equals("interface")) {
+            return null;
+        }
+        String modifiers = header.substring(0, decl.start(1));
+        if (!SEALED_MOD.matcher(modifiers).find() || PERMITS_KW.matcher(header).find()) {
+            return null;
+        }
+        return decl.group(2);
+    }
+
+    // Returns the declared type name if the snippet extends/implements `superName`
+    // as a direct supertype (so it belongs in that sealed type's permits clause);
+    // otherwise null. Generic type arguments are ignored, so a type that merely
+    // mentions the sealed type inside e.g. Iterable<Shape> is not treated as a subtype.
+    private static String subtypeNameIfExtends(String source, String superName) {
+        String header = declHeader(source);
+        java.util.regex.Matcher decl = TYPE_DECL.matcher(header);
+        if (!decl.find()) {
+            return null;
+        }
+        // Strip generics FIRST so an `extends` inside a type-parameter bound
+        // (e.g. `class Registry<T extends Shape>`) is not mistaken for a supertype.
+        String afterName = stripGenerics(header.substring(decl.end()));
+        java.util.regex.Matcher kw = SUPERTYPE_KW.matcher(afterName);
+        if (!kw.find()) {
+            return null;
+        }
+        return mentionsUnqualified(afterName.substring(kw.start()), superName) ? decl.group(2) : null;
+    }
+
+    // Removes the contents of balanced angle-bracket groups (generic arguments).
+    private static String stripGenerics(String text) {
+        StringBuilder sb = new StringBuilder(text.length());
+        int depth = 0;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '<') {
+                depth++;
+            } else if (c == '>') {
+                if (depth > 0) {
+                    depth--;
+                }
+            } else if (depth == 0) {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    // Inserts `permits A, B, ...` immediately before the type body. The body brace
+    // is located while skipping comments and string literals.
+    private static String injectPermits(String header, List<String> subtypeNames) {
+        int brace = bodyBraceIndex(header);
+        if (brace < 0) {
+            return header;
+        }
+        String beforeBody = header.substring(0, brace).stripTrailing();
+        String body = header.substring(brace);
+        return beforeBody + " permits " + String.join(", ", subtypeNames) + " " + body;
+    }
+
+    // True if `word` appears in `text` as a whole, unqualified type reference: not
+    // adjoined to an identifier character or a dot on either side. This excludes both
+    // a qualified name whose tail is `word` (java.rmi.Remote) and a nested type whose
+    // qualifier is `word` (Shape.Marker), neither of which refers to a local `word`.
+    private static boolean mentionsUnqualified(String text, String word) {
+        int from = 0;
+        while (true) {
+            int idx = text.indexOf(word, from);
+            if (idx < 0) {
+                return false;
+            }
+            boolean boundedBefore = idx == 0 || !isReferenceChar(text.charAt(idx - 1));
+            int after = idx + word.length();
+            boolean boundedAfter = after == text.length() || !isReferenceChar(text.charAt(after));
+            if (boundedBefore && boundedAfter) {
+                return true;
+            }
+            from = idx + 1;
+        }
+    }
+
+    private static boolean isReferenceChar(char c) {
+        return c == '.' || Character.isJavaIdentifierPart(c);
+    }
+
+    private static final java.util.regex.Pattern IMPORT_STMT =
+            java.util.regex.Pattern.compile("^\\s*import\\b");
+
+    // True if the snippet is transparent to a pending sealed hierarchy: nothing but
+    // comments/whitespace, or an import. Imports are order-independent and, unlike in
+    // a single .java file, JShell allows them anywhere, so an interleaved import (or a
+    // stray comment between declarations) must not finalise the hierarchy. Strips
+    // comments once and reuses the result for both checks.
+    private static boolean isTransparentToPendingHierarchy(String source) {
+        String stripped = stripComments(source);
+        return stripped.isBlank() || IMPORT_STMT.matcher(stripped).find();
+    }
+
+    // Removes line and block comments, while preserving string, char and text-block
+    // literals verbatim -- so a `//` or `/*` inside a literal is not mistaken for a
+    // comment, and a literal such as "sealed interface X" is not lost.
+    private static String stripComments(String src) {
+        StringBuilder sb = new StringBuilder(src.length());
+        int i = 0;
+        int n = src.length();
+        while (i < n) {
+            int afterComment = commentEnd(src, i);
+            if (afterComment != i) {
+                i = afterComment;
+                continue;
+            }
+            int afterLiteral = literalEnd(src, i);
+            if (afterLiteral != i) {
+                sb.append(src, i, afterLiteral);
+                i = afterLiteral;
+                continue;
+            }
+            sb.append(src.charAt(i));
+            i++;
+        }
+        return sb.toString();
+    }
+
+    // Index of the first `{` that is the type body -- outside comments, string/char/
+    // text-block literals, and parenthesised groups (record components and
+    // annotation arguments, whose own braces must not be mistaken for the body) --
+    // or -1 if there is none.
+    private static int bodyBraceIndex(String src) {
+        int i = 0;
+        int n = src.length();
+        while (i < n) {
+            char c = src.charAt(i);
+            if (c == '{') {
+                return i;
+            } else if (c == '(') {
+                i = skipParens(src, i);
+                continue;
+            }
+            int next = skipNoise(src, i);
+            i = (next != i) ? next : i + 1;
+        }
+        return -1;
+    }
+
+    // Given the index of an opening '(', returns the index just past the matching
+    // ')', tracking nested parens and skipping comments and literals (so an arg such
+    // as ")" or {"a"} is consumed correctly). Returns the length if unbalanced.
+    private static int skipParens(String src, int open) {
+        int depth = 0;
+        int i = open;
+        int n = src.length();
+        while (i < n) {
+            char c = src.charAt(i);
+            if (c == '(') {
+                depth++;
+                i++;
+            } else if (c == ')') {
+                depth--;
+                i++;
+                if (depth == 0) {
+                    return i;
+                }
+            } else {
+                int next = skipNoise(src, i);
+                i = (next != i) ? next : i + 1;
+            }
+        }
+        return n;
+    }
+
+    // If a comment or a string/char/text-block literal starts at i, returns the index
+    // just past it; otherwise returns i unchanged.
+    private static int skipNoise(String src, int i) {
+        int afterComment = commentEnd(src, i);
+        if (afterComment != i) {
+            return afterComment;
+        }
+        return literalEnd(src, i);
+    }
+
+    // If a line or block comment starts at i, returns the index just past it;
+    // otherwise returns i.
+    private static int commentEnd(String src, int i) {
+        int n = src.length();
+        if (i + 1 < n && src.charAt(i) == '/' && src.charAt(i + 1) == '/') {
+            i += 2;
+            while (i < n && src.charAt(i) != '\n') {
+                i++;
+            }
+            return i;
+        }
+        if (i + 1 < n && src.charAt(i) == '/' && src.charAt(i + 1) == '*') {
+            i += 2;
+            while (i + 1 < n && !(src.charAt(i) == '*' && src.charAt(i + 1) == '/')) {
+                i++;
+            }
+            return Math.min(i + 2, n);
+        }
+        return i;
+    }
+
+    // If a string, char or text-block literal starts at i, returns the index just
+    // past it (escapes respected); otherwise returns i.
+    private static int literalEnd(String src, int i) {
+        int n = src.length();
+        if (isTextBlockStart(src, i)) {
+            i += 3;
+            while (i < n && !isTextBlockStart(src, i)) {
+                i++;
+            }
+            return Math.min(i + 3, n);
+        }
+        char c = src.charAt(i);
+        if (c == '"' || c == '\'') {
+            i++;
+            while (i < n && src.charAt(i) != c) {
+                i += (src.charAt(i) == '\\' && i + 1 < n) ? 2 : 1;
+            }
+            return i < n ? i + 1 : i;
+        }
+        return i;
+    }
+
+    private static boolean isTextBlockStart(String src, int i) {
+        return i + 2 < src.length()
+                && src.charAt(i) == '"' && src.charAt(i + 1) == '"' && src.charAt(i + 2) == '"';
+    }
+
+    // Removes annotations (@Name and @Name(...)) from a declaration header so the
+    // start-anchored matcher sees only modifiers and the type keyword. The argument
+    // list is skipped with string-aware paren balancing, so args like ")" or {"a"}
+    // are consumed correctly.
+    private static String stripAnnotations(String header) {
+        StringBuilder sb = new StringBuilder(header.length());
+        int i = 0;
+        int n = header.length();
+        while (i < n) {
+            char c = header.charAt(i);
+            if (c == '@') {
+                i++;
+                while (i < n && (Character.isJavaIdentifierPart(header.charAt(i)) || header.charAt(i) == '.')) {
+                    i++;
+                }
+                int j = i;
+                while (j < n && Character.isWhitespace(header.charAt(j))) {
+                    j++;
+                }
+                if (j < n && header.charAt(j) == '(') {
+                    i = skipParens(header, j);
+                }
+                sb.append(' ');
+            } else {
+                sb.append(c);
+                i++;
+            }
+        }
+        return sb.toString();
     }
 
     private boolean handleEvent(SnippetEvent ste) {
@@ -486,7 +929,7 @@ public class JetShellTool {
                     } else if (ste.exception() instanceof UnresolvedReferenceException) {
                         printUnresolved((UnresolvedReferenceException) ste.exception());
                     } else {
-                        hard("Unexpected execution exception: %s", ste.exception());
+                        problem("Unexpected execution exception: %s", ste.exception());
                         return true;
                     }
                 } else {
@@ -494,13 +937,13 @@ public class JetShellTool {
                 }
             } else if (ste.status() == Status.REJECTED) {
                 if (diagnostics.isEmpty()) {
-                    hard("Failed.");
+                    problem("Failed.");
                 }
                 return true;
             }
         } else if (ste.status() == Status.REJECTED) {
             if (sn instanceof DeclarationSnippet) {
-                hard("Caused failure of dependent %s", ((DeclarationSnippet) sn).name());
+                problem("Caused failure of dependent %s", ((DeclarationSnippet) sn).name());
             }
             printDiagnostics(source, diagnostics);
             return true;
@@ -603,10 +1046,10 @@ public class JetShellTool {
     private void printDiagnostics(String source, List<Diag> diagnostics) {
         for (Diag diag : diagnostics) {
             if (diag.isError()) {
-                hard("Error:");
+                problem("Error:");
             }
             for (String line : diag.getMessage(Locale.getDefault()).split("\\R")) {
-                hard("%s", line);
+                problem("%s", line);
             }
             int startPos = (int) diag.getStartPosition();
             int endPos = (int) diag.getEndPosition();
@@ -618,12 +1061,12 @@ public class JetShellTool {
                 int lineEnd = lineMatcher.find(searchFrom) ? lineMatcher.start() : source.length();
                 String srcLine = source.substring(pos, lineEnd);
                 if (startPos >= pos && startPos <= lineEnd) {
-                    hard("%s", srcLine);
+                    problem("%s", srcLine);
                     StringBuilder sb = new StringBuilder();
                     for (int i = 0; i < srcLine.length(); i++) {
                         sb.append(i >= (startPos - pos) && i < (endPos - pos) ? '^' : ' ');
                     }
-                    hard("%s", sb.toString());
+                    problem("%s", sb.toString());
                     break;
                 }
                 if (lineEnd == source.length()) break;
@@ -634,7 +1077,7 @@ public class JetShellTool {
     }
 
     private void printEvalException(EvalException ex) {
-        hard("Exception %s: %s", ex.getExceptionClassName(), ex.getMessage());
+        problem("Exception %s: %s", ex.getExceptionClassName(), ex.getMessage());
         for (StackTraceElement ste : ex.getStackTrace()) {
             StringBuilder sb = new StringBuilder();
             String cn = ste.getClassName();
@@ -648,13 +1091,13 @@ public class JetShellTool {
             if (!ste.getMethodName().isEmpty()) {
                 sb.append(ste.getMethodName());
             }
-            hard("    at %s(%s:%d)", sb, ste.getFileName(), ste.getLineNumber());
+            problem("    at %s(%s:%d)", sb, ste.getFileName(), ste.getLineNumber());
         }
     }
 
     private void printUnresolved(UnresolvedReferenceException ex) {
         DeclarationSnippet sn = ex.getSnippet();
-        hard("Attempted to use %s which cannot be invoked until %s is declared",
+        problem("Attempted to use %s which cannot be invoked until %s is declared",
                 sn.name(), unresolved(sn));
     }
 
@@ -665,8 +1108,20 @@ public class JetShellTool {
 
     // --- Command processing ---
 
+    // Commands that are safe to run without first finalising a pending sealed-type
+    // hierarchy: they do not observe the deferred snippet declarations, so we leave
+    // the hierarchy pending and let the user keep declaring its subtypes. (Some,
+    // like /doc and /source, do read imports/classpath via getState(), but not the
+    // pending declarations.) Every other command finalises the hierarchy first,
+    // since it may list, save, replay or otherwise observe the resulting snippets.
+    // See Issue #17.
+    private static final Set<String> NON_STATE_COMMANDS =
+            Set.of("/help", "/classpath", "/resolve", "/deps", "/doc", "/source");
+
     private void processCommand(String cmd) {
         if (cmd.startsWith("/-")) {
+            // Re-running a history entry depends on the current snippet state.
+            flushPendingSealed();
             try {
                 cmdUseHistoryEntry(Integer.parseInt(cmd.substring(1)));
                 return;
@@ -694,6 +1149,9 @@ public class JetShellTool {
                         Arrays.stream(matches).map(c -> c.command).collect(Collectors.joining(", ")));
                 return;
             }
+        }
+        if (!NON_STATE_COMMANDS.contains(command.command)) {
+            flushPendingSealed();
         }
         boolean handled = command.run.handle(arg);
         if (handled && command.kind == CommandKind.REPLAY) {
@@ -969,6 +1427,7 @@ public class JetShellTool {
         try {
             String content = Files.readString(toPathResolvingUserHome(filename));
             processSource(content);
+            flushPendingSealed();
         } catch (IOException e) {
             error("File '%s' not found: %s", filename, e.getMessage());
         }
@@ -1025,6 +1484,7 @@ public class JetShellTool {
             }
             processSource(source);
         }
+        flushPendingSealed();
     }
 
     private void cmdClasspath(String arg) {
@@ -1186,6 +1646,12 @@ public class JetShellTool {
                         }
                         cmdlineStartup = "";
                         break;
+                    case "-plain":
+                        outputMode = OutputMode.PLAIN;
+                        break;
+                    case "-quiet":
+                        outputMode = OutputMode.QUIET;
+                        break;
                     case "-help":
                         printUsage();
                         return EARLY_EXIT;
@@ -1211,6 +1677,8 @@ public class JetShellTool {
         cmdout.printf("  -cp <path>                 Specify where to find user class files%n");
         cmdout.printf("  -startup <file>            One run replacement for the start-up definitions%n");
         cmdout.printf("  -nostartup                 Do not run the start-up definitions%n");
+        cmdout.printf("  -plain                     Drop the '|  ' prefix from batch output%n");
+        cmdout.printf("  -quiet                     Suppress informational output; errors go to stderr%n");
         cmdout.printf("  -help                      Print a synopsis of standard options%n");
         cmdout.printf("  -version                   Version information%n");
     }
