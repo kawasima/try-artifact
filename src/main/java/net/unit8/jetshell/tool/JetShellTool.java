@@ -571,12 +571,12 @@ public class JetShellTool {
 
     // --- Sealed-type deferral helpers (Issue #17) ---
 
-    // Anchored type-declaration matcher: leading annotations/modifiers, then the
-    // kind keyword (group 1) and the declared name (group 2). Anchoring to the
-    // start avoids matching keywords that appear inside string literals or comments.
+    // Anchored type-declaration matcher: leading modifiers, then the kind keyword
+    // (group 1) and the declared name (group 2). Annotations are removed by
+    // stripAnnotations before matching, and anchoring to the start avoids matching
+    // keywords that appear inside string literals or comments.
     private static final java.util.regex.Pattern TYPE_DECL = java.util.regex.Pattern.compile(
-            "^\\s*(?:@[\\w.]+(?:\\s*\\([^)]*\\))?\\s+"
-            + "|(?:public|protected|private|abstract|static|final|strictfp|sealed|non-sealed)\\s+)*"
+            "^\\s*(?:(?:public|protected|private|abstract|static|final|strictfp|sealed|non-sealed)\\s+)*"
             + "(class|interface|record|enum)\\s+([A-Za-z_$][\\w$]*)");
     // `sealed` as a modifier -- the negative lookbehind excludes the `non-sealed` keyword.
     private static final java.util.regex.Pattern SEALED_MOD = java.util.regex.Pattern.compile("(?<!-)\\bsealed\\b");
@@ -592,7 +592,7 @@ public class JetShellTool {
     private static String declHeader(String source) {
         int brace = bodyBraceIndex(source);
         String prefix = brace >= 0 ? source.substring(0, brace) : source;
-        return stripComments(prefix);
+        return stripAnnotations(stripComments(prefix));
     }
 
     // Returns the declared type name if the snippet is a `sealed` interface/class
@@ -744,8 +744,10 @@ public class JetShellTool {
         return sb.toString();
     }
 
-    // Index of the first `{` that is real code -- outside comments and string, char
-    // and text-block literals -- or -1 if there is none.
+    // Index of the first `{` that is the type body -- outside comments, string/char/
+    // text-block literals, and parenthesised groups (record components and
+    // annotation arguments, whose own braces must not be mistaken for the body) --
+    // or -1 if there is none.
     private static int bodyBraceIndex(String src) {
         int i = 0;
         int n = src.length();
@@ -753,6 +755,8 @@ public class JetShellTool {
             char c = src.charAt(i);
             if (c == '{') {
                 return i;
+            } else if (c == '(') {
+                i = skipParens(src, i);
             } else if (c == '/' && i + 1 < n && src.charAt(i + 1) == '/') {
                 i += 2;
                 while (i < n && src.charAt(i) != '\n') {
@@ -771,11 +775,7 @@ public class JetShellTool {
                 }
                 i += 3;
             } else if (c == '"' || c == '\'') {
-                i++;
-                while (i < n && src.charAt(i) != c) {
-                    i += (src.charAt(i) == '\\' && i + 1 < n) ? 2 : 1;
-                }
-                i++;
+                i = skipQuoted(src, i);
             } else {
                 i++;
             }
@@ -786,6 +786,76 @@ public class JetShellTool {
     private static boolean isTextBlockStart(String src, int i) {
         return i + 2 < src.length()
                 && src.charAt(i) == '"' && src.charAt(i + 1) == '"' && src.charAt(i + 2) == '"';
+    }
+
+    // Given the index of an opening quote, returns the index just past the closing
+    // quote (escapes respected). Used to skip string and char literals.
+    private static int skipQuoted(String src, int open) {
+        char q = src.charAt(open);
+        int i = open + 1;
+        int n = src.length();
+        while (i < n && src.charAt(i) != q) {
+            i += (src.charAt(i) == '\\' && i + 1 < n) ? 2 : 1;
+        }
+        return i < n ? i + 1 : i;
+    }
+
+    // Given the index of an opening '(', returns the index just past the matching
+    // ')', tracking nested parens and skipping string/char literals (so an arg such
+    // as ")" or {"a"} is consumed correctly). Returns the length if unbalanced.
+    private static int skipParens(String src, int open) {
+        int depth = 0;
+        int i = open;
+        int n = src.length();
+        while (i < n) {
+            char c = src.charAt(i);
+            if (c == '"' || c == '\'') {
+                i = skipQuoted(src, i);
+            } else if (c == '(') {
+                depth++;
+                i++;
+            } else if (c == ')') {
+                depth--;
+                i++;
+                if (depth == 0) {
+                    return i;
+                }
+            } else {
+                i++;
+            }
+        }
+        return n;
+    }
+
+    // Removes annotations (@Name and @Name(...)) from a declaration header so the
+    // start-anchored matcher sees only modifiers and the type keyword. The argument
+    // list is skipped with string-aware paren balancing, so args like ")" or {"a"}
+    // are consumed correctly.
+    private static String stripAnnotations(String header) {
+        StringBuilder sb = new StringBuilder(header.length());
+        int i = 0;
+        int n = header.length();
+        while (i < n) {
+            char c = header.charAt(i);
+            if (c == '@') {
+                i++;
+                while (i < n && (Character.isJavaIdentifierPart(header.charAt(i)) || header.charAt(i) == '.')) {
+                    i++;
+                }
+                int j = i;
+                while (j < n && Character.isWhitespace(header.charAt(j))) {
+                    j++;
+                }
+                if (j < n && header.charAt(j) == '(') {
+                    i = skipParens(header, j);
+                }
+                sb.append(' ');
+            } else {
+                sb.append(c);
+                i++;
+            }
+        }
+        return sb.toString();
     }
 
     private boolean handleEvent(SnippetEvent ste) {
@@ -986,10 +1056,13 @@ public class JetShellTool {
 
     // --- Command processing ---
 
-    // Commands that neither read nor replay snippet state. For these we leave a
-    // deferred sealed-type hierarchy pending so the user can keep declaring its
-    // subtypes; every other command finalises the hierarchy first (it may observe
-    // the resulting snippets). See Issue #17.
+    // Commands that are safe to run without first finalising a pending sealed-type
+    // hierarchy: they do not observe the deferred snippet declarations, so we leave
+    // the hierarchy pending and let the user keep declaring its subtypes. (Some,
+    // like /doc and /source, do read imports/classpath via getState(), but not the
+    // pending declarations.) Every other command finalises the hierarchy first,
+    // since it may list, save, replay or otherwise observe the resulting snippets.
+    // See Issue #17.
     private static final Set<String> NON_STATE_COMMANDS =
             Set.of("/help", "/classpath", "/resolve", "/deps", "/doc", "/source");
 

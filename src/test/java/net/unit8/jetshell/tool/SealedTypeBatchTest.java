@@ -207,4 +207,30 @@ public class SealedTypeBatchTest {
         assertTrue(output.contains("Expression value is: 8.0"),
                 "An interleaved import must not break the hierarchy. Output:\n" + output);
     }
+
+    // Copilot review: an annotation whose argument string contains ')' must not
+    // defeat declaration detection.
+    public void annotationArgumentWithParenIsHandled() throws Exception {
+        String output = run(
+                "@SuppressWarnings(\")x\") sealed interface Shape {}\n" +
+                "record Circle(double radius) implements Shape {}\n" +
+                "record Rect(double width, double height) implements Shape {}\n" +
+                "new Circle(2.0).radius()\n" +
+                "/exit\n");
+        assertTrue(output.contains("Expression value is: 2.0"),
+                "A ')' inside an annotation string must not break detection. Output:\n" + output);
+    }
+
+    // Copilot review: an annotation array argument contains braces that must not be
+    // mistaken for the type body.
+    public void annotationArrayArgumentIsHandled() throws Exception {
+        String output = run(
+                "@SuppressWarnings({\"a\", \"b\"}) sealed interface Shape {}\n" +
+                "record Circle(double radius) implements Shape {}\n" +
+                "record Rect(double width, double height) implements Shape {}\n" +
+                "new Circle(3.0).radius()\n" +
+                "/exit\n");
+        assertTrue(output.contains("Expression value is: 3.0"),
+                "Braces in an annotation array must not be read as the type body. Output:\n" + output);
+    }
 }
