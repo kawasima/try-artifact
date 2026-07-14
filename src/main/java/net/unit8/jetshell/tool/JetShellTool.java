@@ -48,11 +48,29 @@ public class JetShellTool {
     private boolean suppressOutput = false;
     private boolean hadFailure = false;
 
-    // Batch output verbosity, selected by -plain / -quiet (see Issue #12).
-    //   NORMAL: informational and error lines carry the "|  " prefix (interactive-friendly).
-    //   PLAIN:  same streams, but no prefix (grep/diff-friendly).
-    //   QUIET:  informational output is suppressed; errors still go to stderr, unprefixed.
-    enum OutputMode { NORMAL, PLAIN, QUIET }
+    // Batch output verbosity, selected by -plain / -quiet (see Issue #12). Each mode
+    // carries its whole policy so it lives in one table (cf. CommandKind below):
+    //   prefix        -- prepended to every line ("|  " only interactively).
+    //   mutesInfo     -- hard() informational output is suppressed.
+    //   errorsToStderr-- problem() diagnostics go to stderr instead of stdout.
+    //   showsPrompt   -- the input prompt is emitted.
+    enum OutputMode {
+        NORMAL("|  ", false, false, true),
+        PLAIN("", false, false, false),
+        QUIET("", true, true, false);
+
+        final String prefix;
+        final boolean mutesInfo;
+        final boolean errorsToStderr;
+        final boolean showsPrompt;
+
+        OutputMode(String prefix, boolean mutesInfo, boolean errorsToStderr, boolean showsPrompt) {
+            this.prefix = prefix;
+            this.mutesInfo = mutesInfo;
+            this.errorsToStderr = errorsToStderr;
+            this.showsPrompt = showsPrompt;
+        }
+    }
     private OutputMode outputMode = OutputMode.NORMAL;
 
     // A sealed interface/class whose permitted subtypes are declared on later lines
@@ -127,31 +145,32 @@ public class JetShellTool {
 
     // --- Output helpers ---
 
-    // The "|  " prefix is only added in NORMAL mode; -plain / -quiet drop it.
-    private String outputPrefix() {
-        return outputMode == OutputMode.NORMAL ? "|  " : "";
+    private void emit(PrintStream stream, String format, Object... args) {
+        stream.printf(outputMode.prefix + format + "%n", args);
     }
 
     // Informational output (declarations, expression values, banners). Muted during
     // startup and entirely in QUIET mode.
     public void hard(String format, Object... args) {
-        if (suppressOutput || outputMode == OutputMode.QUIET) {
+        if (suppressOutput || outputMode.mutesInfo) {
             return;
         }
-        cmdout.printf(outputPrefix() + format + "%n", args);
+        emit(cmdout, format, args);
     }
 
     // Snippet compile/runtime error output. Stays on stdout in NORMAL/PLAIN (as it
     // always has), but is redirected to stderr in QUIET so it survives the silenced
-    // stdout. Not muted during startup, so a bad startup snippet is still reported.
+    // stdout. Muted during startup, like hard(), so start-up noise stays hidden.
     public void problem(String format, Object... args) {
-        PrintStream out = outputMode == OutputMode.QUIET ? cmderr : cmdout;
-        out.printf(outputPrefix() + format + "%n", args);
+        if (suppressOutput) {
+            return;
+        }
+        emit(outputMode.errorsToStderr ? cmderr : cmdout, format, args);
     }
 
     public void error(String format, Object... args) {
         // Errors are always shown, even during startup (suppressOutput only mutes normal output)
-        cmderr.printf(outputPrefix() + format + "%n", args);
+        emit(cmderr, format, args);
     }
 
     public void fluff(String format, Object... args) {
@@ -337,7 +356,7 @@ public class JetShellTool {
         try {
             while (live) {
                 // -plain / -quiet drop the prompt so batch output stays machine-clean.
-                String prompt = outputMode != OutputMode.NORMAL ? ""
+                String prompt = !outputMode.showsPrompt ? ""
                         : incomplete.isEmpty() ? "\n-> " : ">> ";
                 String raw;
                 try {
@@ -361,10 +380,9 @@ public class JetShellTool {
     private void runWithReader(BufferedReader reader) throws IOException {
         String incomplete = "";
         while (live) {
-            String prompt = incomplete.isEmpty() ? "\u0005" : "\u0006";
             // -plain / -quiet drop the prompt so batch output stays machine-clean.
-            if (outputMode == OutputMode.NORMAL) {
-                console.print(prompt);
+            if (outputMode.showsPrompt) {
+                console.print(incomplete.isEmpty() ? "\u0005" : "\u0006");
                 console.flush();
             }
 
