@@ -473,6 +473,11 @@ public class JetShellTool {
                 pendingSubtypeNames.add(subtypeName);
                 return false;
             }
+            if (isBlankOrCommentOnly(source)) {
+                // A comment or blank snippet between the sealed type and its subtypes
+                // (as split from a whole file) must not finalise the hierarchy.
+                return processCompleteSource(source);
+            }
             // The contiguous hierarchy ended; finalise this one block, then route the
             // snippet afresh -- it may open a new (possibly nested) sealed hierarchy,
             // which subsequent snippets will feed. Single-level flush here so a nested
@@ -579,9 +584,14 @@ public class JetShellTool {
     private static final java.util.regex.Pattern SUPERTYPE_KW =
             java.util.regex.Pattern.compile("\\b(?:extends|implements)\\b");
 
+    // The declaration prefix (before the body), with comments removed first so a
+    // leading comment (which analyzeCompletion prepends to the following snippet)
+    // does not defeat the start-anchored declaration matcher, and so a brace inside
+    // a comment is not mistaken for the body.
     private static String declHeader(String source) {
-        int brace = source.indexOf('{');
-        return brace >= 0 ? source.substring(0, brace) : source;
+        String s = stripComments(source);
+        int brace = s.indexOf('{');
+        return brace >= 0 ? s.substring(0, brace) : s;
     }
 
     // Returns the declared type name if the snippet is a `sealed` interface/class
@@ -618,7 +628,7 @@ public class JetShellTool {
             return null;
         }
         String supertypes = stripGenerics(header.substring(decl.end()).substring(kw.start()));
-        return containsWord(supertypes, superName) ? decl.group(2) : null;
+        return mentionsUnqualified(supertypes, superName) ? decl.group(2) : null;
     }
 
     // Removes the contents of balanced angle-bracket groups (generic arguments).
@@ -651,9 +661,42 @@ public class JetShellTool {
         return beforeBody + " permits " + String.join(", ", subtypeNames) + " " + body;
     }
 
-    private static boolean containsWord(String text, String word) {
-        return java.util.regex.Pattern.compile("\\b" + java.util.regex.Pattern.quote(word) + "\\b")
+    // True if `word` appears in `text` as an unqualified type reference -- a whole
+    // word not preceded by a dot, so a qualified name like java.rmi.Remote does not
+    // count as a reference to a local `Remote`.
+    private static boolean mentionsUnqualified(String text, String word) {
+        return java.util.regex.Pattern.compile("(?<![.\\w$])" + java.util.regex.Pattern.quote(word) + "\\b")
                 .matcher(text).find();
+    }
+
+    // True if the snippet contains nothing but comments and whitespace, so it must
+    // be transparent to a pending sealed hierarchy rather than finalising it.
+    private static boolean isBlankOrCommentOnly(String source) {
+        return stripComments(source).isBlank();
+    }
+
+    private static String stripComments(String src) {
+        StringBuilder sb = new StringBuilder(src.length());
+        int i = 0;
+        int n = src.length();
+        while (i < n) {
+            char c = src.charAt(i);
+            if (c == '/' && i + 1 < n && src.charAt(i + 1) == '/') {
+                while (i < n && src.charAt(i) != '\n') {
+                    i++;
+                }
+            } else if (c == '/' && i + 1 < n && src.charAt(i + 1) == '*') {
+                i += 2;
+                while (i + 1 < n && !(src.charAt(i) == '*' && src.charAt(i + 1) == '/')) {
+                    i++;
+                }
+                i += 2;
+            } else {
+                sb.append(c);
+                i++;
+            }
+        }
+        return sb.toString();
     }
 
     private boolean handleEvent(SnippetEvent ste) {

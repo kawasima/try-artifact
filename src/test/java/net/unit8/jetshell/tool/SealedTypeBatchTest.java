@@ -7,6 +7,8 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertTrue;
@@ -113,5 +115,42 @@ public class SealedTypeBatchTest {
                 "/exit\n");
         assertTrue(output.contains("Expression value is: 4.0"),
                 "non-sealed subtype and string literal must not break the hierarchy. Output:\n" + output);
+    }
+
+    // Copilot review #1: a comment or blank line between the sealed type and its
+    // subtypes (as seen when a whole file is processed via /open) must not finalise
+    // the hierarchy prematurely.
+    public void commentsBetweenSealedTypeAndSubtypesDoNotBreakIt() throws Exception {
+        Path file = Files.createTempFile("hier", ".jsh");
+        Files.writeString(file,
+                "sealed interface Shape {}\n" +
+                "// the circle case\n" +
+                "record Circle(double radius) implements Shape {}\n" +
+                "\n" +
+                "/* the rectangle case */\n" +
+                "record Rect(double width, double height) implements Shape {}\n" +
+                "new Circle(6.0).radius()\n");
+        try {
+            String output = run("/open " + file + "\n/exit\n");
+            assertTrue(output.contains("Expression value is: 6.0"),
+                    "Comments/blank lines must be transparent to the hierarchy. Output:\n" + output);
+        } finally {
+            Files.deleteIfExists(file);
+        }
+    }
+
+    // Copilot review #2: a supertype referenced by a qualified name whose final
+    // segment equals the sealed type's simple name (e.g. java.rmi.Remote vs a local
+    // Remote) must NOT be treated as a permitted subtype.
+    public void qualifiedSupertypeSharingSimpleNameIsNotPermitted() throws Exception {
+        String output = run(
+                "sealed interface Remote {}\n" +
+                "record Node() implements Remote {}\n" +
+                // Gateway extends the JDK's java.rmi.Remote, a different type.
+                "interface Gateway extends java.rmi.Remote {}\n" +
+                "new Node()\n" +
+                "/exit\n");
+        assertTrue(output.contains("Expression value is: Node[]"),
+                "Gateway (java.rmi.Remote) must not join the local Remote's permits. Output:\n" + output);
     }
 }
