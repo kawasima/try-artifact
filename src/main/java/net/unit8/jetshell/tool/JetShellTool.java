@@ -48,6 +48,13 @@ public class JetShellTool {
     private boolean suppressOutput = false;
     private boolean hadFailure = false;
 
+    // Batch output verbosity, selected by -plain / -quiet (see Issue #12).
+    //   NORMAL: informational and error lines carry the "|  " prefix (interactive-friendly).
+    //   PLAIN:  same streams, but no prefix (grep/diff-friendly).
+    //   QUIET:  informational output is suppressed; errors still go to stderr, unprefixed.
+    enum OutputMode { NORMAL, PLAIN, QUIET }
+    private OutputMode outputMode = OutputMode.NORMAL;
+
     // A sealed interface/class whose permitted subtypes are declared on later lines
     // cannot compile as its own JShell compilation unit (no permits, no same-unit
     // subtypes). We defer such a declaration, collect the contiguous subtype
@@ -120,15 +127,31 @@ public class JetShellTool {
 
     // --- Output helpers ---
 
+    // The "|  " prefix is only added in NORMAL mode; -plain / -quiet drop it.
+    private String outputPrefix() {
+        return outputMode == OutputMode.NORMAL ? "|  " : "";
+    }
+
+    // Informational output (declarations, expression values, banners). Muted during
+    // startup and entirely in QUIET mode.
     public void hard(String format, Object... args) {
-        if (!suppressOutput) {
-            cmdout.printf("|  " + format + "%n", args);
+        if (suppressOutput || outputMode == OutputMode.QUIET) {
+            return;
         }
+        cmdout.printf(outputPrefix() + format + "%n", args);
+    }
+
+    // Snippet compile/runtime error output. Stays on stdout in NORMAL/PLAIN (as it
+    // always has), but is redirected to stderr in QUIET so it survives the silenced
+    // stdout. Not muted during startup, so a bad startup snippet is still reported.
+    public void problem(String format, Object... args) {
+        PrintStream out = outputMode == OutputMode.QUIET ? cmderr : cmdout;
+        out.printf(outputPrefix() + format + "%n", args);
     }
 
     public void error(String format, Object... args) {
         // Errors are always shown, even during startup (suppressOutput only mutes normal output)
-        cmderr.printf("|  " + format + "%n", args);
+        cmderr.printf(outputPrefix() + format + "%n", args);
     }
 
     public void fluff(String format, Object... args) {
@@ -302,7 +325,7 @@ public class JetShellTool {
                 runWithReader(reader);
             }
         } catch (IOException ex) {
-            hard("Unexpected exception: %s", ex);
+            problem("Unexpected exception: %s", ex);
             hadFailure = true;
         } finally {
             closeState();
@@ -313,7 +336,9 @@ public class JetShellTool {
         String incomplete = "";
         try {
             while (live) {
-                String prompt = incomplete.isEmpty() ? "\n-> " : ">> ";
+                // -plain / -quiet drop the prompt so batch output stays machine-clean.
+                String prompt = outputMode != OutputMode.NORMAL ? ""
+                        : incomplete.isEmpty() ? "\n-> " : ">> ";
                 String raw;
                 try {
                     raw = lineReader.readLine(prompt);
@@ -328,7 +353,7 @@ public class JetShellTool {
             }
             flushPendingSealed();
         } catch (Exception ex) {
-            hard("Unexpected exception: %s", ex);
+            problem("Unexpected exception: %s", ex);
             hadFailure = true;
         }
     }
@@ -337,8 +362,11 @@ public class JetShellTool {
         String incomplete = "";
         while (live) {
             String prompt = incomplete.isEmpty() ? "\u0005" : "\u0006";
-            console.print(prompt);
-            console.flush();
+            // -plain / -quiet drop the prompt so batch output stays machine-clean.
+            if (outputMode == OutputMode.NORMAL) {
+                console.print(prompt);
+                console.flush();
+            }
 
             String raw = reader.readLine();
             if (raw == null) {
@@ -883,7 +911,7 @@ public class JetShellTool {
                     } else if (ste.exception() instanceof UnresolvedReferenceException) {
                         printUnresolved((UnresolvedReferenceException) ste.exception());
                     } else {
-                        hard("Unexpected execution exception: %s", ste.exception());
+                        problem("Unexpected execution exception: %s", ste.exception());
                         return true;
                     }
                 } else {
@@ -891,13 +919,13 @@ public class JetShellTool {
                 }
             } else if (ste.status() == Status.REJECTED) {
                 if (diagnostics.isEmpty()) {
-                    hard("Failed.");
+                    problem("Failed.");
                 }
                 return true;
             }
         } else if (ste.status() == Status.REJECTED) {
             if (sn instanceof DeclarationSnippet) {
-                hard("Caused failure of dependent %s", ((DeclarationSnippet) sn).name());
+                problem("Caused failure of dependent %s", ((DeclarationSnippet) sn).name());
             }
             printDiagnostics(source, diagnostics);
             return true;
@@ -1000,10 +1028,10 @@ public class JetShellTool {
     private void printDiagnostics(String source, List<Diag> diagnostics) {
         for (Diag diag : diagnostics) {
             if (diag.isError()) {
-                hard("Error:");
+                problem("Error:");
             }
             for (String line : diag.getMessage(Locale.getDefault()).split("\\R")) {
-                hard("%s", line);
+                problem("%s", line);
             }
             int startPos = (int) diag.getStartPosition();
             int endPos = (int) diag.getEndPosition();
@@ -1015,12 +1043,12 @@ public class JetShellTool {
                 int lineEnd = lineMatcher.find(searchFrom) ? lineMatcher.start() : source.length();
                 String srcLine = source.substring(pos, lineEnd);
                 if (startPos >= pos && startPos <= lineEnd) {
-                    hard("%s", srcLine);
+                    problem("%s", srcLine);
                     StringBuilder sb = new StringBuilder();
                     for (int i = 0; i < srcLine.length(); i++) {
                         sb.append(i >= (startPos - pos) && i < (endPos - pos) ? '^' : ' ');
                     }
-                    hard("%s", sb.toString());
+                    problem("%s", sb.toString());
                     break;
                 }
                 if (lineEnd == source.length()) break;
@@ -1031,7 +1059,7 @@ public class JetShellTool {
     }
 
     private void printEvalException(EvalException ex) {
-        hard("Exception %s: %s", ex.getExceptionClassName(), ex.getMessage());
+        problem("Exception %s: %s", ex.getExceptionClassName(), ex.getMessage());
         for (StackTraceElement ste : ex.getStackTrace()) {
             StringBuilder sb = new StringBuilder();
             String cn = ste.getClassName();
@@ -1045,13 +1073,13 @@ public class JetShellTool {
             if (!ste.getMethodName().isEmpty()) {
                 sb.append(ste.getMethodName());
             }
-            hard("    at %s(%s:%d)", sb, ste.getFileName(), ste.getLineNumber());
+            problem("    at %s(%s:%d)", sb, ste.getFileName(), ste.getLineNumber());
         }
     }
 
     private void printUnresolved(UnresolvedReferenceException ex) {
         DeclarationSnippet sn = ex.getSnippet();
-        hard("Attempted to use %s which cannot be invoked until %s is declared",
+        problem("Attempted to use %s which cannot be invoked until %s is declared",
                 sn.name(), unresolved(sn));
     }
 
@@ -1600,6 +1628,12 @@ public class JetShellTool {
                         }
                         cmdlineStartup = "";
                         break;
+                    case "-plain":
+                        outputMode = OutputMode.PLAIN;
+                        break;
+                    case "-quiet":
+                        outputMode = OutputMode.QUIET;
+                        break;
                     case "-help":
                         printUsage();
                         return EARLY_EXIT;
@@ -1625,6 +1659,8 @@ public class JetShellTool {
         cmdout.printf("  -cp <path>                 Specify where to find user class files%n");
         cmdout.printf("  -startup <file>            One run replacement for the start-up definitions%n");
         cmdout.printf("  -nostartup                 Do not run the start-up definitions%n");
+        cmdout.printf("  -plain                     Drop the '|  ' prefix from batch output%n");
+        cmdout.printf("  -quiet                     Suppress informational output; errors go to stderr%n");
         cmdout.printf("  -help                      Print a synopsis of standard options%n");
         cmdout.printf("  -version                   Version information%n");
     }
