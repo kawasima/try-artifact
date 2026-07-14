@@ -153,4 +153,58 @@ public class SealedTypeBatchTest {
         assertTrue(output.contains("Expression value is: Node[]"),
                 "Gateway (java.rmi.Remote) must not join the local Remote's permits. Output:\n" + output);
     }
+
+    // Review #1: a `extends` inside a type-parameter bound must not be read as a
+    // supertype, so a generic type bounded by the sealed type is not a subtype.
+    public void typeParameterBoundIsNotASupertype() throws Exception {
+        String output = run(
+                "sealed interface Shape {}\n" +
+                "record Circle(double radius) implements Shape {}\n" +
+                // Registry is bounded by Shape but does NOT extend/implement it.
+                "class Registry<T extends Shape> { T held; }\n" +
+                "new Circle(3.0).radius()\n" +
+                "/exit\n");
+        assertTrue(output.contains("Expression value is: 3.0"),
+                "A type-parameter bound must not make Registry a permitted subtype. Output:\n" + output);
+    }
+
+    // Review #2: a `//` or `/*` inside a string literal in the declaration header
+    // must not be treated as a comment and truncate detection.
+    public void commentMarkerInsideStringLiteralDoesNotBreakDetection() throws Exception {
+        String output = run(
+                "@SuppressWarnings(\"a//b\") sealed interface Shape {}\n" +
+                "record Circle(double radius) implements Shape {}\n" +
+                "record Rect(double width, double height) implements Shape {}\n" +
+                "new Circle(5.0).radius()\n" +
+                "/exit\n");
+        assertTrue(output.contains("Expression value is: 5.0"),
+                "A string literal containing // must not break sealed detection. Output:\n" + output);
+    }
+
+    // Review #3: a brace inside a comment in the sealed header must not be mistaken
+    // for the type body when the permits clause is injected.
+    public void braceInsideCommentInSealedHeaderIsHandled() throws Exception {
+        String output = run(
+                "sealed interface Shape /* body starts at { below */ {}\n" +
+                "record Circle(double radius) implements Shape {}\n" +
+                "record Rect(double width, double height) implements Shape {}\n" +
+                "new Circle(7.0).radius()\n" +
+                "/exit\n");
+        assertTrue(output.contains("Expression value is: 7.0"),
+                "A brace inside a comment must not misplace the permits clause. Output:\n" + output);
+    }
+
+    // Review #4: an import statement between the sealed type and its subtypes must
+    // be transparent to the hierarchy, not finalise it prematurely.
+    public void importBetweenSealedTypeAndSubtypesIsTransparent() throws Exception {
+        String output = run(
+                "sealed interface Shape {}\n" +
+                "import java.util.Optional;\n" +
+                "record Circle(double radius) implements Shape {}\n" +
+                "record Rect(double width, double height) implements Shape {}\n" +
+                "new Circle(8.0).radius()\n" +
+                "/exit\n");
+        assertTrue(output.contains("Expression value is: 8.0"),
+                "An interleaved import must not break the hierarchy. Output:\n" + output);
+    }
 }

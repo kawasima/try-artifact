@@ -473,9 +473,9 @@ public class JetShellTool {
                 pendingSubtypeNames.add(subtypeName);
                 return false;
             }
-            if (isBlankOrCommentOnly(source)) {
-                // A comment or blank snippet between the sealed type and its subtypes
-                // (as split from a whole file) must not finalise the hierarchy.
+            if (isBlankOrCommentOnly(source) || isImport(source)) {
+                // A comment, blank or import snippet between the sealed type and its
+                // subtypes must not finalise the hierarchy; evaluate it and keep going.
                 return processCompleteSource(source);
             }
             // The contiguous hierarchy ended; finalise this one block, then route the
@@ -584,14 +584,15 @@ public class JetShellTool {
     private static final java.util.regex.Pattern SUPERTYPE_KW =
             java.util.regex.Pattern.compile("\\b(?:extends|implements)\\b");
 
-    // The declaration prefix (before the body), with comments removed first so a
-    // leading comment (which analyzeCompletion prepends to the following snippet)
-    // does not defeat the start-anchored declaration matcher, and so a brace inside
-    // a comment is not mistaken for the body.
+    // The declaration prefix (before the body). The body brace is located while
+    // skipping comments and string literals (so a brace inside either is not taken
+    // for the body), then comments are removed so a leading comment -- which
+    // analyzeCompletion prepends to the following snippet -- does not defeat the
+    // start-anchored declaration matcher.
     private static String declHeader(String source) {
-        String s = stripComments(source);
-        int brace = s.indexOf('{');
-        return brace >= 0 ? s.substring(0, brace) : s;
+        int brace = bodyBraceIndex(source);
+        String prefix = brace >= 0 ? source.substring(0, brace) : source;
+        return stripComments(prefix);
     }
 
     // Returns the declared type name if the snippet is a `sealed` interface/class
@@ -623,12 +624,14 @@ public class JetShellTool {
         if (!decl.find()) {
             return null;
         }
-        java.util.regex.Matcher kw = SUPERTYPE_KW.matcher(header.substring(decl.end()));
+        // Strip generics FIRST so an `extends` inside a type-parameter bound
+        // (e.g. `class Registry<T extends Shape>`) is not mistaken for a supertype.
+        String afterName = stripGenerics(header.substring(decl.end()));
+        java.util.regex.Matcher kw = SUPERTYPE_KW.matcher(afterName);
         if (!kw.find()) {
             return null;
         }
-        String supertypes = stripGenerics(header.substring(decl.end()).substring(kw.start()));
-        return mentionsUnqualified(supertypes, superName) ? decl.group(2) : null;
+        return mentionsUnqualified(afterName.substring(kw.start()), superName) ? decl.group(2) : null;
     }
 
     // Removes the contents of balanced angle-bracket groups (generic arguments).
@@ -650,9 +653,10 @@ public class JetShellTool {
         return sb.toString();
     }
 
-    // Inserts `permits A, B, ...` immediately before the type body.
+    // Inserts `permits A, B, ...` immediately before the type body. The body brace
+    // is located while skipping comments and string literals.
     private static String injectPermits(String header, List<String> subtypeNames) {
-        int brace = header.indexOf('{');
+        int brace = bodyBraceIndex(header);
         if (brace < 0) {
             return header;
         }
@@ -675,6 +679,19 @@ public class JetShellTool {
         return stripComments(source).isBlank();
     }
 
+    private static final java.util.regex.Pattern IMPORT_STMT =
+            java.util.regex.Pattern.compile("^\\s*import\\b");
+
+    // True if the snippet is an import statement. Imports are order-independent and,
+    // unlike in a single .java file, JShell allows them anywhere, so an interleaved
+    // import must stay transparent to a pending sealed hierarchy.
+    private static boolean isImport(String source) {
+        return IMPORT_STMT.matcher(stripComments(source)).find();
+    }
+
+    // Removes line and block comments, while preserving string, char and text-block
+    // literals verbatim -- so a `//` or `/*` inside a literal is not mistaken for a
+    // comment, and a literal such as "sealed interface X" is not lost.
     private static String stripComments(String src) {
         StringBuilder sb = new StringBuilder(src.length());
         int i = 0;
@@ -682,6 +699,7 @@ public class JetShellTool {
         while (i < n) {
             char c = src.charAt(i);
             if (c == '/' && i + 1 < n && src.charAt(i + 1) == '/') {
+                i += 2;
                 while (i < n && src.charAt(i) != '\n') {
                     i++;
                 }
@@ -691,12 +709,83 @@ public class JetShellTool {
                     i++;
                 }
                 i += 2;
+            } else if (isTextBlockStart(src, i)) {
+                sb.append("\"\"\"");
+                i += 3;
+                while (i < n && !isTextBlockStart(src, i)) {
+                    sb.append(src.charAt(i));
+                    i++;
+                }
+                if (i < n) {
+                    sb.append("\"\"\"");
+                    i += 3;
+                }
+            } else if (c == '"' || c == '\'') {
+                sb.append(c);
+                i++;
+                while (i < n && src.charAt(i) != c) {
+                    sb.append(src.charAt(i));
+                    if (src.charAt(i) == '\\' && i + 1 < n) {
+                        sb.append(src.charAt(i + 1));
+                        i += 2;
+                    } else {
+                        i++;
+                    }
+                }
+                if (i < n) {
+                    sb.append(c);
+                    i++;
+                }
             } else {
                 sb.append(c);
                 i++;
             }
         }
         return sb.toString();
+    }
+
+    // Index of the first `{` that is real code -- outside comments and string, char
+    // and text-block literals -- or -1 if there is none.
+    private static int bodyBraceIndex(String src) {
+        int i = 0;
+        int n = src.length();
+        while (i < n) {
+            char c = src.charAt(i);
+            if (c == '{') {
+                return i;
+            } else if (c == '/' && i + 1 < n && src.charAt(i + 1) == '/') {
+                i += 2;
+                while (i < n && src.charAt(i) != '\n') {
+                    i++;
+                }
+            } else if (c == '/' && i + 1 < n && src.charAt(i + 1) == '*') {
+                i += 2;
+                while (i + 1 < n && !(src.charAt(i) == '*' && src.charAt(i + 1) == '/')) {
+                    i++;
+                }
+                i += 2;
+            } else if (isTextBlockStart(src, i)) {
+                i += 3;
+                while (i < n && !isTextBlockStart(src, i)) {
+                    i++;
+                }
+                i += 3;
+            } else if (c == '"' || c == '\'') {
+                i++;
+                while (i < n && src.charAt(i) != c) {
+                    i += (src.charAt(i) == '\\' && i + 1 < n) ? 2 : 1;
+                }
+                i++;
+            } else {
+                i++;
+            }
+        }
+        return -1;
+    }
+
+    private static boolean isTextBlockStart(String src, int i) {
+        return i + 2 < src.length()
+                && src.charAt(i) == '"' && src.charAt(i + 1) == '"' && src.charAt(i + 2) == '"';
     }
 
     private boolean handleEvent(SnippetEvent ste) {
